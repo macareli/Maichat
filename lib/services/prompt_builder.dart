@@ -1,3 +1,4 @@
+import 'dart:convert';
 import '../models/character.dart';
 import '../models/message.dart';
 import '../models/preset.dart';
@@ -38,7 +39,7 @@ class PromptSection {
 /// history greedily fitted into the remaining context budget (newest-first).
 class PromptBuilder {
   PromptBuilder({required this.macros, TokenEstimator? tokens})
-      : tokens = tokens ?? const HeuristicTokenEstimator();
+    : tokens = tokens ?? const HeuristicTokenEstimator();
 
   final MacroEngine macros;
   final TokenEstimator tokens;
@@ -72,7 +73,10 @@ class PromptBuilder {
     String? scenario,
     String hintText = '',
     int hintDepth = 0,
+    List<({String text, int depth})> controlInjections = const [],
+    String? leadingSystemOverride,
   }) {
+    final customSystem = leadingSystemOverride?.trim() ?? '';
     final charName = character?.displayName ?? '';
     // The caller may resolve a different window than the preset carries (the
     // "use the model's own limit" case); the preset's value is the fallback.
@@ -162,7 +166,7 @@ class PromptBuilder {
     void emit(String label, String role, String content) {
       final text = macros.evaluate(content, ctx).trim();
       if (text.isEmpty) return;
-      final msg = ChatMessage(role: role, content: text);
+      final msg = ChatMessage(promptProtected: true, role: role, content: text);
       (sawHistory ? trailing : leading).add(_Part(label, msg));
     }
 
@@ -172,7 +176,8 @@ class PromptBuilder {
       // Enabled state lives on the order; `main` is never skipped (ST parity).
       if (!entry.enabled && block.identifier != PromptId.main) continue;
 
-      if (block.injectionPosition == InjectionPosition.absolute && !block.marker) {
+      if (block.injectionPosition == InjectionPosition.absolute &&
+          !block.marker) {
         absolute.add(block);
         continue;
       }
@@ -202,10 +207,19 @@ class PromptBuilder {
     }
 
     // PLACEHOLDER_HISTORY
-    int cost(ChatMessage m) => tokens.estimate(m.content) + _perMessageOverhead;
+    int cost(ChatMessage m) =>
+        tokens.estimate(m.content) +
+        _perMessageOverhead +
+        (m.toolRun == null
+            ? 0
+            : tokens.estimate(
+                jsonEncode(m.toolRun!.history.map((v) => v.toJson()).toList()),
+              ));
 
-    var fixedTokens =
-        [...leading, ...trailing].fold<int>(0, (sum, p) => sum + cost(p.msg));
+    var fixedTokens = [
+      ...leading,
+      ...trailing,
+    ].fold<int>(0, (sum, p) => sum + cost(p.msg));
 
     // Absolute-injection blocks are placed into the chat history at a depth
     // from the end rather than inline. Resolve them now (so their tokens are
@@ -219,13 +233,19 @@ class PromptBuilder {
     for (final block in absolute) {
       final text = macros.evaluate(block.content, ctx).trim();
       if (text.isEmpty) continue;
-      final msg = ChatMessage(role: block.role, content: text);
-      injections.add(_Injection(
-        depth: block.injectionDepth,
-        order: block.injectionOrder,
-        seq: injections.length,
-        part: _Part('Injected (depth ${block.injectionDepth})', msg),
-      ));
+      final msg = ChatMessage(
+        promptProtected: true,
+        role: block.role,
+        content: text,
+      );
+      injections.add(
+        _Injection(
+          depth: block.injectionDepth,
+          order: block.injectionOrder,
+          seq: injections.length,
+          part: _Part('Injected (depth ${block.injectionDepth})', msg),
+        ),
+      );
       fixedTokens += cost(msg);
     }
 
@@ -237,13 +257,19 @@ class PromptBuilder {
     for (final inj in world.injections) {
       final text = macros.evaluate(inj.text, ctx).trim();
       if (text.isEmpty) continue;
-      final msg = ChatMessage(role: inj.role.wireName, content: text);
-      injections.add(_Injection(
-        depth: inj.depth,
-        order: 0,
-        seq: injections.length,
-        part: _Part('World info (depth ${inj.depth})', msg),
-      ));
+      final msg = ChatMessage(
+        promptProtected: true,
+        role: inj.role.wireName,
+        content: text,
+      );
+      injections.add(
+        _Injection(
+          depth: inj.depth,
+          order: 0,
+          seq: injections.length,
+          part: _Part('World info (depth ${inj.depth})', msg),
+        ),
+      );
       fixedTokens += cost(msg);
     }
 
@@ -252,17 +278,21 @@ class PromptBuilder {
     // same depth-injection path as lore, so its tokens are reserved before
     // history fills the budget and _oneSystemBlock re-tags it to a user turn when
     // it lands inside the conversation — preserving the one-leading-system rule.
-    if (summaryText.trim().isNotEmpty && !_presetUsesSummary(preset, character)) {
+    if (summaryText.trim().isNotEmpty &&
+        !_presetUsesSummary(preset, character)) {
       final msg = ChatMessage(
+        promptProtected: true,
         role: 'system',
         content: '<past_events>\n${summaryText.trim()}\n</past_events>',
       );
-      injections.add(_Injection(
-        depth: summaryDepth,
-        order: 100,
-        seq: injections.length,
-        part: _Part('Summary (depth $summaryDepth)', msg),
-      ));
+      injections.add(
+        _Injection(
+          depth: summaryDepth,
+          order: 100,
+          seq: injections.length,
+          part: _Part('Summary (depth $summaryDepth)', msg),
+        ),
+      );
       fixedTokens += cost(msg);
     }
 
@@ -277,13 +307,19 @@ class PromptBuilder {
     ]) {
       final content = entry.$2.trim();
       if (content.isEmpty) continue;
-      final msg = ChatMessage(role: 'system', content: content);
-      injections.add(_Injection(
-        depth: memoryDepth,
-        order: 90,
-        seq: injections.length,
-        part: _Part('${entry.$1} (depth $memoryDepth)', msg),
-      ));
+      final msg = ChatMessage(
+        promptProtected: true,
+        role: 'system',
+        content: content,
+      );
+      injections.add(
+        _Injection(
+          depth: memoryDepth,
+          order: 90,
+          seq: injections.length,
+          part: _Part('${entry.$1} (depth $memoryDepth)', msg),
+        ),
+      );
       fixedTokens += cost(msg);
     }
 
@@ -299,16 +335,21 @@ class PromptBuilder {
     final hint = macros.evaluate(hintText, ctx).trim();
     if (hint.isNotEmpty) {
       final depth = hintDepth < 0 ? 0 : hintDepth;
-      final msg = ChatMessage(role: 'system', content: wrapResponseHint(hint));
-      injections.add(_Injection(
-        depth: depth,
-        order: -100,
-        seq: injections.length,
-        part: _Part('Response hint (depth $depth)', msg),
-      ));
+      final msg = ChatMessage(
+        promptProtected: true,
+        role: 'system',
+        content: wrapResponseHint(hint),
+      );
+      injections.add(
+        _Injection(
+          depth: depth,
+          order: -100,
+          seq: injections.length,
+          part: _Part('Response hint (depth $depth)', msg),
+        ),
+      );
       fixedTokens += cost(msg);
     }
-
 
     //
     // A heavy preset frame plus a large character sheet can consume the entire
@@ -319,18 +360,42 @@ class PromptBuilder {
     // sending no conversation is never the useful answer, so guarantee history a
     // floor of the budget even when that means overshooting `maxContext` — which
     // is a preset field, not a hard limit the host enforces.
+    for (final control in controlInjections) {
+      final message = ChatMessage(
+        promptProtected: true,
+        role: 'user',
+        content: control.text,
+      );
+      injections.add(
+        _Injection(
+          depth: control.depth < 0 ? 0 : control.depth,
+          order: -90,
+          seq: injections.length,
+          part: _Part('OOC correction (depth ${control.depth})', message),
+        ),
+      );
+      fixedTokens += cost(message);
+    }
     final floor = (budget * _historyFloorFraction).round();
     var remaining = (budget - fixedTokens).clamp(0, 1 << 30).toInt();
     if (remaining < floor) remaining = floor;
     final chosen = <ChatMessage>[];
-    for (final msg in resolvedHistory.reversed) {
-      final c = cost(msg);
-      if (c > remaining) break;
-      remaining -= c;
-      chosen.add(msg);
+    if (customSystem.isNotEmpty) {
+      // A side prompt replaces the leading frame. Build its complete candidate
+      // first: pricing that discarded frame here would lose history before
+      // the replacement has had a chance to free its context space.
+      chosen.addAll(resolvedHistory.reversed);
+    } else {
+      for (final msg in resolvedHistory.reversed) {
+        final c = cost(msg);
+        if (c > remaining) break;
+        remaining -= c;
+        chosen.add(msg);
+      }
     }
-    final history0 =
-        chosen.reversed.map((m) => _Part('Chat history', m)).toList();
+    final history0 = chosen.reversed
+        .map((m) => _Part('Chat history', m))
+        .toList();
 
     // Merge absolute injections in at their depth-from-end. Depth d means "d
     // messages follow this block", so it lands at index (len - d). Within a
@@ -360,7 +425,52 @@ class PromptBuilder {
       }
     }
 
-    final parts = _oneSystemBlock(<_Part>[...leading, ...history0, ...trailing]);
+    var parts = _oneSystemBlock(<_Part>[...leading, ...history0, ...trailing]);
+    if (customSystem.isNotEmpty) {
+      parts = [
+        _Part(
+          'Side system prompt',
+          ChatMessage(
+            role: 'system',
+            content: customSystem,
+            promptProtected: true,
+          ),
+        ),
+        for (final part in parts)
+          if (part.msg.role != 'system') part,
+      ];
+      // Fit the prompt that will actually be sent. Protected depth/trailing
+      // instructions survive; each removable history item keeps its complete
+      // tool call/result group together.
+      bool removable(_Part part) =>
+          part.label == 'Chat history' && !part.msg.promptProtected;
+      int promptCost(List<_Part> candidate) => mergeSameRole(
+        candidate.map((part) => part.msg).toList(),
+      ).fold(0, (sum, message) => sum + cost(message));
+      List<_Part> withoutOldest(int count) {
+        var skipped = 0;
+        return [
+          for (final part in parts)
+            if (!removable(part) || skipped++ >= count) part,
+        ];
+      }
+
+      if (promptCost(parts) > budget) {
+        var low = 0;
+        var high = parts.where(removable).length;
+        // Search the oldest history prefix to remove. Rebuilding and pricing
+        // once per removed turn would become quadratic in a long side chat.
+        while (low < high) {
+          final middle = (low + high) ~/ 2;
+          if (promptCost(withoutOldest(middle)) > budget) {
+            low = middle + 1;
+          } else {
+            high = middle;
+          }
+        }
+        parts = withoutOldest(low);
+      }
+    }
     // Collapse consecutive same-role turns into one. This is not cosmetic:
     //
     //  * Presets that frame the prompt with many small blocks (tags, headings,
@@ -402,7 +512,8 @@ class PromptBuilder {
       if (has(b.content)) return true;
     }
     if (character != null &&
-        (has(character.systemPrompt) || has(character.postHistoryInstructions))) {
+        (has(character.systemPrompt) ||
+            has(character.postHistoryInstructions))) {
       return true;
     }
     return false;
@@ -431,14 +542,17 @@ class PromptBuilder {
       final isSystem = part.msg.role == 'system';
       if (!isSystem) conversationStarted = true;
       if (isSystem && conversationStarted) {
-        out.add(_Part(
-          part.label,
-          ChatMessage(
-            role: 'user',
-            content: part.msg.content,
-            images: part.msg.images,
+        out.add(
+          _Part(
+            part.label,
+            ChatMessage(
+              promptProtected: true,
+              role: 'user',
+              content: part.msg.content,
+              images: part.msg.images,
+            ),
           ),
-        ));
+        );
       } else {
         out.add(part);
       }
@@ -478,7 +592,9 @@ class PromptBuilder {
   /// Groups consecutive same-label parts into sections, summing token cost, so
   /// the breakdown reads in prompt order and its totals match the real budget.
   static List<PromptSection> _sectionsFrom(
-      List<_Part> parts, int Function(ChatMessage) cost) {
+    List<_Part> parts,
+    int Function(ChatMessage) cost,
+  ) {
     final out = <PromptSection>[];
     for (final part in parts) {
       final t = cost(part.msg);
@@ -491,12 +607,14 @@ class PromptBuilder {
           messageCount: prev.messageCount + 1,
         );
       } else {
-        out.add(PromptSection(
-          label: part.label,
-          role: part.msg.role,
-          tokens: t,
-          messageCount: 1,
-        ));
+        out.add(
+          PromptSection(
+            label: part.label,
+            role: part.msg.role,
+            tokens: t,
+            messageCount: 1,
+          ),
+        );
       }
     }
     return out;

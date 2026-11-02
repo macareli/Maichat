@@ -1,8 +1,11 @@
+import 'dart:async';
 import 'dart:ui' show ImageFilter;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/physics.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart' hide Provider;
@@ -13,17 +16,22 @@ import '../models/chat_interface.dart';
 import '../models/message.dart';
 import '../models/message_image.dart';
 import '../models/provider.dart';
+import '../services/btw.dart';
 import '../services/chat_client.dart';
 import '../services/chat_graph.dart';
 import '../services/jank_logger.dart';
+import '../services/studio/studio_commands.dart';
 import '../state/app_state.dart';
 import '../widgets/avatar_image.dart';
 import '../widgets/avatar_swipe_sheet.dart';
+import '../widgets/btw_thread.dart';
+import '../widgets/chat_tool_results.dart';
 import '../widgets/character_avatar.dart';
 import '../widgets/floating_images_layer.dart';
 import '../widgets/interface_preset_sheet.dart';
 import '../widgets/message_bubble.dart';
 import '../widgets/message_info_sheet.dart';
+import '../models/appearance.dart';
 import '../widgets/message_markdown.dart';
 import '../widgets/picture_viewer.dart';
 import '../widgets/smooth_image.dart';
@@ -41,6 +49,7 @@ import 'image_gen/image_gen_sheet.dart';
 import 'prompt_view_screen.dart';
 import 'presets/chat_preset_panel.dart';
 import 'presets/preset_pickers.dart';
+import 'studio/shell/slash_panel.dart';
 import 'section_screen.dart';
 import 'settings_screen.dart';
 
@@ -61,14 +70,76 @@ const Key jumpToLatestKey = ValueKey('jump-to-latest');
 /// every option lives (provider/model, edit, export, restart, delete, and the
 /// jumps to the other sections).
 class ChatScreen extends StatefulWidget {
-  const ChatScreen({super.key});
+  const ChatScreen({super.key, this.host});
+
+  /// Set when the chat is shown inside another screen that keeps chats of its
+  /// own — the Studio's Playground (see `ChatHost`). Everything about the chat
+  /// is the same; [ChatScreenHost] names the few things the host swaps in.
+  final ChatScreenHost? host;
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
+/// What a screen hosting [ChatScreen] swaps in — and only that: the thread,
+/// the bubbles and their actions, the floating pictures, the composer and
+/// everything it opens are the chat's own.
+class ChatScreenHost {
+  const ChatScreenHost({
+    required this.drawer,
+    this.aboveComposer,
+    this.composerActions = const <WidgetBuilder>[],
+  });
+
+  /// The sidebar the menu square opens, in place of the chat's own (whose
+  /// jumps — Characters, Chats, Profile — lead out of the host).
+  final WidgetBuilder drawer;
+
+  /// Rides above the composer (and the group bar), rising out of it the way
+  /// its own panels do: the Studio's areas capsule.
+  final WidgetBuilder? aboveComposer;
+
+  /// Extra symbols at the end of the composer's operations strip.
+  final List<WidgetBuilder> composerActions;
+}
+
+/// Closes either the chat's push-aside menu or a standalone modal sidebar.
+void closeChatSidebar(BuildContext context) {
+  final pane = context.getInheritedWidgetOfExactType<_PaneScope>();
+  if (pane != null) {
+    pane.close();
+  } else {
+    Navigator.of(context).pop();
+  }
+}
+
+/// The chat's provider & model picker — the sheet "Provider & model" opens in
+/// the chat sidebar, and the Studio Playground's provider symbol.
+void showChatProviderSheet(BuildContext context) => showModalBottomSheet<void>(
+  context: context,
+  showDragHandle: true,
+  isScrollControlled: true,
+  builder: (_) => _QuickSettingsSheet(
+    onManage: () {
+      Navigator.of(context).pop();
+      Navigator.of(
+        context,
+      ).push(MaterialPageRoute<void>(builder: (_) => const SettingsScreen()));
+    },
+  ),
+);
+
 class _ChatScreenState extends State<ChatScreen> {
   final _ComposerController _input = _ComposerController();
+  // The `/`-command suggestion panel over the composer — the same list the
+  // Studio's composer shows. It watches [_input] and completes a highlighted
+  // row into the box; the chat's only command today is `/btw` (handled at
+  // send time in [_send]), but the state takes the whole list so more can be
+  // added without re-plumbing.
+  late final StudioSlashState _slash = StudioSlashState(
+    input: _input,
+    commands: () => _chatSlashCommands,
+  );
   // The expressive composer's outline follows the Material theme and lifts into a
   // primary-tinted glow while the box holds focus, so a rebuild has to run when
   // focus comes and goes.
@@ -83,6 +154,19 @@ class _ChatScreenState extends State<ChatScreen> {
   final GlobalKey _composerDockKey = GlobalKey();
   double _composerDockHeight = 0;
   final ScrollController _scroll = ScrollController();
+  late final BtwThreadController _aside = BtwThreadController(
+    ask: (question, history, run, onProgress) {
+      final state = context.read<AppState>();
+      return state.askAside(
+        question,
+        conversation: state.active,
+        thread: _aside.activeThread,
+        sideHistory: history,
+        run: run,
+        onProgress: onProgress,
+      );
+    },
+  );
 
   /// The index of the message currently being edited in place, or null.
   int? _editingIndex;
@@ -205,6 +289,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _scroll.removeListener(_onScroll);
     _composerFocus.removeListener(_onComposerFocus);
     _composerFocus.dispose();
+    _slash.dispose();
     // Leaving the chat is one of the points a hint must survive; the box may well
     // still be open with something typed in it.
     _flushHint();
@@ -212,6 +297,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _edit.dispose();
     _input.dispose();
     _scroll.dispose();
+    _aside.dispose();
     super.dispose();
   }
 
@@ -238,11 +324,13 @@ class _ChatScreenState extends State<ChatScreen> {
   /// to shrink; a box grown by typing overlays the thread and leaves the reserve
   /// alone.
   void _measureComposerDock() {
-    final box = _composerDockKey.currentContext?.findRenderObject() as RenderBox?;
+    final box =
+        _composerDockKey.currentContext?.findRenderObject() as RenderBox?;
     if (box == null || !box.hasSize) return;
     final height = box.size.height;
     if ((height - _composerDockHeight).abs() <= 0.5) return;
-    final resting = _composerDockHeight == 0 ||
+    final resting =
+        _composerDockHeight == 0 ||
         _input.text.isEmpty ||
         height < _composerDockHeight;
     if (resting) {
@@ -311,8 +399,22 @@ class _ChatScreenState extends State<ChatScreen> {
     if (changed && mounted) setState(() {});
   }
 
+  /// The `/`-commands the chat composer offers. The chat's only one is
+  /// `/btw`; the Studio has its own richer list, so this stays chat-owned.
+  /// A list (not a constant) so future commands slot in here alone.
+  static List<StudioCommand> get _chatSlashCommands => [
+    kBuiltInCommands.firstWhere((c) => c.name == 'btw'),
+  ];
+
   Future<void> _send(AppState state) async {
     final text = _input.text;
+    // `/btw <question>` is a side question, not a turn — and it may be asked
+    // while a reply is still being written.
+    final aside = btwQuestion(text);
+    if (aside != null) {
+      _askAside(state, aside);
+      return;
+    }
     final images = List<MessageImage>.of(_attachments);
     if ((text.trim().isEmpty && images.isEmpty) || state.streaming) return;
     if (!state.isConfigured) {
@@ -332,6 +434,45 @@ class _ChatScreenState extends State<ChatScreen> {
     _stickToLatest();
   }
 
+  /// Opens a side conversation without adding a turn to the story.
+  void _askAside(AppState state, String question) {
+    if (question.isNotEmpty && !state.isConfigured) {
+      _openSettings();
+      return;
+    }
+    if (_aside.busy) {
+      _toast('Stop the side answer before asking another question.');
+      return;
+    }
+    _input.clear();
+    FocusManager.instance.primaryFocus?.unfocus();
+    _aside.startThread();
+    setState(() {
+      if (MediaQuery.sizeOf(context).width < 720) _drawerOpen = false;
+      _asideOpen = true;
+    });
+    if (question.isNotEmpty) unawaited(_aside.submit(question));
+  }
+
+  void _closeAside() {
+    FocusManager.instance.primaryFocus?.unfocus();
+    _aside.stop();
+    setState(() => _asideOpen = false);
+  }
+
+  void _setAsideOpen(bool open) {
+    if (_asideOpen == open) return;
+    if (!open) {
+      _closeAside();
+      return;
+    }
+    FocusManager.instance.primaryFocus?.unfocus();
+    setState(() {
+      if (MediaQuery.sizeOf(context).width < 720) _drawerOpen = false;
+      _asideOpen = true;
+    });
+  }
+
   /// Picks a picture out of the app's own gallery for the next send.
   Future<void> _attachFromGallery(AppState state) async {
     final ref = await showGalleryPickerSheet(
@@ -340,8 +481,9 @@ class _ChatScreenState extends State<ChatScreen> {
       characterId: state.active.characterId,
     );
     if (ref == null || !mounted) return;
-    setState(() => _attachments
-        .add(MessageImage(ref: ref, mime: mimeForRef(ref))));
+    setState(
+      () => _attachments.add(MessageImage(ref: ref, mime: mimeForRef(ref))),
+    );
   }
 
   /// Picks pictures off the device for the next send. The bytes are written into
@@ -378,32 +520,33 @@ class _ChatScreenState extends State<ChatScreen> {
   /// are made. [prompt] seeds the prompt box, which is how a message's "Generate
   /// image" action hands its own text over.
   void _openImageStudio({String prompt = ''}) => showImageStudio(
-        context,
-        conversationId: context.read<AppState>().active.id,
-        prompt: prompt,
-      );
+    context,
+    conversationId: context.read<AppState>().active.id,
+    prompt: prompt,
+  );
 
-  void _openSettings() => Navigator.of(context).push(
-        MaterialPageRoute<void>(builder: (_) => const SettingsScreen()),
-      );
+  void _openSettings() => Navigator.of(
+    context,
+  ).push(MaterialPageRoute<void>(builder: (_) => const SettingsScreen()));
 
   void _openSection(String title, IconData icon) => Navigator.of(context).push(
-        MaterialPageRoute<void>(
-            builder: (_) => SectionScreen(title: title, icon: icon)),
-      );
+    MaterialPageRoute<void>(
+      builder: (_) => SectionScreen(title: title, icon: icon),
+    ),
+  );
 
   /// The fork tree this chat belongs to. Selecting a branch there pops back
   /// here, and this screen already rebuilds off the active chat, so it shows
   /// the branch that was picked.
   void _openChatGraph(String conversationId) => Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (_) => ChatGraphScreen(conversationId: conversationId),
-        ),
-      );
+    MaterialPageRoute<void>(
+      builder: (_) => ChatGraphScreen(conversationId: conversationId),
+    ),
+  );
 
-  void _openCharacters() => Navigator.of(context).push(
-        MaterialPageRoute<void>(builder: (_) => const CharactersScreen()),
-      );
+  void _openCharacters() => Navigator.of(
+    context,
+  ).push(MaterialPageRoute<void>(builder: (_) => const CharactersScreen()));
 
   /// Back to the landing Home screen (the first route).
   void _goHome() => Navigator.of(context).popUntil((route) => route.isFirst);
@@ -411,29 +554,21 @@ class _ChatScreenState extends State<ChatScreen> {
   /// Home first, then open the full Chats list, so Back is predictable.
   void _goChats() {
     _goHome();
-    Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => const ChatsScreen()),
-    );
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute<void>(builder: (_) => const ChatsScreen()));
   }
 
-  void _openQuickSettings() => showModalBottomSheet<void>(
-        context: context,
-        showDragHandle: true,
-        isScrollControlled: true,
-        builder: (_) => _QuickSettingsSheet(onManage: () {
-          Navigator.of(context).pop();
-          _openSettings();
-        }),
-      );
+  void _openQuickSettings() => showChatProviderSheet(context);
 
   /// Opens the chat's own settings: title, background, a style of its own, and
   /// the characters taking part. Replaces the old rename-only dialog — renaming
   /// is now the first field on that screen.
   void _editChat(AppState state) => Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (_) => ChatSettingsScreen(conversationId: state.active.id),
-        ),
-      );
+    MaterialPageRoute<void>(
+      builder: (_) => ChatSettingsScreen(conversationId: state.active.id),
+    ),
+  );
 
   /// Hands the thread to the export flow, which offers the shapes and then the
   /// file / clipboard chooser.
@@ -504,11 +639,13 @@ class _ChatScreenState extends State<ChatScreen> {
     final keyboard = MediaQuery.viewInsetsOf(context).bottom;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(
-        content: Text(message),
-        behavior: SnackBarBehavior.floating,
-        margin: EdgeInsets.only(left: 16, right: 16, bottom: 16 + keyboard),
-      ));
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          behavior: SnackBarBehavior.floating,
+          margin: EdgeInsets.only(left: 16, right: 16, bottom: 16 + keyboard),
+        ),
+      );
   }
 
   /// Returns to the newest message. The list is reversed, so "the end" is
@@ -605,7 +742,49 @@ class _ChatScreenState extends State<ChatScreen> {
       selection: TextSelection.collapsed(offset: text.length),
     );
   }
-// APPEND-MARKER-1
+
+  /// Whether a `/btw` side question is showing in the aside pane on the
+  /// right, instead of the one-shot sheet. Held in state, not the store: it
+  /// is a view of this screen, like the ops strip, and the conversation's
+  /// transcript is never re-encoded for it.
+  bool _asideOpen = false;
+  bool _asideVisible = false;
+
+  /// Whether the side-menu pane is *aimed* at open. A drag in flight may
+  /// disagree with this for a moment; it is the target, not the geometry.
+  bool _drawerOpen = false;
+
+  /// Whether any part of the drawer is on screen. This is what phone focus,
+  /// semantics, hit-testing and Android Back must answer to: a drawer that is
+  /// still animating closed is still in the way.
+  bool _drawerVisible = false;
+
+  /// Stable across streaming updates. Actions read the current chat when
+  /// invoked, and the menu subscribes to changes in its own displayed data.
+  late final Widget _drawer = _ChatDrawer(
+    onProfile: _goHome,
+    onCharacters: _openCharacters,
+    onChats: _goChats,
+    onGallery: () {
+      final state = context.read<AppState>();
+      openChatGallery(context, state.active.id);
+    },
+    onEditChat: () => _editChat(context.read<AppState>()),
+    onChatGraph: () => _openChatGraph(context.read<AppState>().active.id),
+    onProviderModel: _openQuickSettings,
+    onSettings: _openSettings,
+    onImageGen: _openImageStudio,
+    onExport: () => _exportChat(context.read<AppState>()),
+    onRestart: () => _restartChat(context.read<AppState>()),
+    onDelete: () => _deleteChat(context.read<AppState>()),
+    onNotifications: () =>
+        _openSection('Notifications', Icons.notifications_outlined),
+  );
+
+  /// The aside pane's width in logical pixels on wide screens, where the chat
+  /// and the aside sit side by side. On phones the pane covers the chat and
+  /// needs no stored width. Persisted nowhere — it resets with the screen.
+  double _asideWidth = 360;
 
   @override
   Widget build(BuildContext context) {
@@ -640,6 +819,8 @@ class _ChatScreenState extends State<ChatScreen> {
       _editingIndex = null;
     }
     if (conversation.id != _lastConvId) {
+      _asideOpen = false;
+      _asideVisible = false;
       _lastConvId = conversation.id;
       _lastMessageCount = count;
       _unread = 0;
@@ -663,6 +844,7 @@ class _ChatScreenState extends State<ChatScreen> {
         _unread = 0;
       }
     }
+    _aside.bind(state, conversation.id);
     // Keep pinned to the newest text as a reply streams in — but only while the
     // reader is at the bottom, so scrolling up during a stream is never undone.
     if (state.streaming && _stick) _scrollToEnd();
@@ -700,98 +882,136 @@ class _ChatScreenState extends State<ChatScreen> {
     // height measured, and only it reserves room at the thread's bottom.
     final floatingComposer = ui.composerStyle == ComposerStyle.expressive;
     if (floatingComposer) {
-      WidgetsBinding.instance
-          .addPostFrameCallback((_) => _measureComposerDock());
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => _measureComposerDock(),
+      );
     }
 
-    return Scaffold(
-      backgroundColor: bg,
-      // The keyboard does not resize this screen — see [_KeyboardShift]. Letting
-      // the Scaffold shrink the body meant the thread's viewport changed height on
-      // every frame of the keyboard's animation, and a laid-out-again message list
-      // has to be *painted* again: a screenful of markdown, HTML and selectable
-      // text, fifteen times on the way up. That is the stutter felt when tapping
-      // into the message box, and it cost the same whether the chat held six turns
-      // or ninety.
-      resizeToAvoidBottomInset: false,
-      // The drawer owns a temporary focus scope. Clear the route's remembered
-      // composer when that scope opens, or removing it restores the focused
-      // field and gives EditableText a fresh keyboard token.
-      onDrawerChanged: (opened) {
-        if (opened) FocusManager.instance.primaryFocus?.unfocus();
-      },
-      drawer: _ChatDrawer(
-        onProfile: _goHome,
-        onCharacters: _openCharacters,
-        onChats: _goChats,
-        onGallery: () => openChatGallery(context, conversation.id),
-        onEditChat: () => _editChat(state),
-        onChatGraph: () => _openChatGraph(conversation.id),
-        onProviderModel: _openQuickSettings,
-        onSettings: _openSettings,
-        onImageGen: _openImageStudio,
-        onExport: () => _exportChat(state),
-        onRestart: () => _restartChat(state),
-        onDelete: () => _deleteChat(state),
-        onNotifications: () =>
-            _openSection('Notifications', Icons.notifications_outlined),
-      ),
-      body: Stack(
-        children: [
-          // This chat's own picture, behind everything and behind nothing else's.
-          // A thread's own background is the more specific choice and wins; the
-          // one on the interface is what a saved look can carry, and so what
-          // dresses every chat that has not picked its own.
-          if ((conversation.backgroundImage ?? ui.backgroundImage) != null)
-            Positioned.fill(
-              child: _ChatBackground(
-                image: conversation.backgroundImage ?? ui.backgroundImage!,
-                opacity: conversation.backgroundImage != null
-                    ? conversation.backgroundOpacity
-                    : ui.backgroundOpacity,
-              ),
+    // Ordinary chats and the Studio Playground share the same pane layout.
+    final hosted = widget.host != null;
+    final chat = Stack(
+      children: [
+        // This chat's own picture, behind everything and behind nothing else's.
+        // A thread's own background is the more specific choice and wins; the
+        // one on the interface is what a saved look can carry, and so what
+        // dresses every chat that has not picked its own.
+        if ((conversation.backgroundImage ?? ui.backgroundImage) != null)
+          Positioned.fill(
+            child: _ChatBackground(
+              image: conversation.backgroundImage ?? ui.backgroundImage!,
+              opacity: conversation.backgroundImage != null
+                  ? conversation.backgroundOpacity
+                  : ui.backgroundOpacity,
             ),
-          // The legacy send bar is furniture at the foot of the chat, so the
-          // whole column slides as one to clear the keyboard. The expressive
-          // composer floats over a static thread and lifts on its own — see
-          // [_chatBody] — so it must not be wrapped in the slide.
-          if (floatingComposer)
-            _chatBody(state, conversation, ui, topInset, true)
-          else
-            _KeyboardShift(
-              child: _chatBody(state, conversation, ui, topInset, false),
+          ),
+        // The legacy send bar is furniture at the foot of the chat, so the
+        // whole column slides as one to clear the keyboard. The expressive
+        // composer floats over a static thread and lifts on its own — see
+        // [_chatBody] — so it must not be wrapped in the slide.
+        if (floatingComposer)
+          _chatBody(state, conversation, ui, topInset, true)
+        else
+          _KeyboardShift(
+            child: _chatBody(state, conversation, ui, topInset, false),
+          ),
+        // The soft squares that float over the thread without boxing it in:
+        // the menu on the left, and — unless it has been put away — the looks
+        // sheet on the right.
+        Positioned(
+          top: topInset + 6,
+          left: 8,
+          child: Builder(
+            builder: (ctx) => _ChatMenuButton(
+              opacity: ui.menuButtonOpacity,
+              onTap: _togglePane,
             ),
-          // The soft squares that float over the thread without boxing it in: the
-          // drawer on the left, and — unless it has been put away — the looks
-          // sheet on the right.
+          ),
+        ),
+        if (ui.looksButtonEnabled)
           Positioned(
             top: topInset + 6,
-            left: 8,
-            child: Builder(
-              builder: (ctx) => _ChatMenuButton(
-                opacity: ui.menuButtonOpacity,
-                onTap: () => Scaffold.of(ctx).openDrawer(),
+            right: 8,
+            child: _ChatMenuButton(
+              buttonKey: chatLooksButtonKey,
+              icon: Icons.style_outlined,
+              tooltip: 'Looks',
+              opacity: ui.looksButtonOpacity,
+              onTap: () => showInterfacePresetSheet(
+                context,
+                conversationId: conversation.id,
               ),
             ),
           ),
-          if (ui.looksButtonEnabled)
-            Positioned(
-              top: topInset + 6,
-              right: 8,
-              child: _ChatMenuButton(
-                buttonKey: chatLooksButtonKey,
-                icon: Icons.style_outlined,
-                tooltip: 'Looks',
-                opacity: ui.looksButtonOpacity,
-                onTap: () => showInterfacePresetSheet(
-                  context,
-                  conversationId: conversation.id,
-                ),
-              ),
+      ],
+    );
+
+    return PopScope(
+      canPop: !_drawerVisible && !_asideVisible && !_asideOpen,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        if (_asideVisible || _asideOpen) {
+          if (!_aside.dismissTransientUi()) _closeAside();
+        } else {
+          _setPaneOpen(false);
+        }
+      },
+      child: Scaffold(
+        backgroundColor: bg,
+        resizeToAvoidBottomInset: false,
+        body: _ChatPanes(
+          key: ValueKey('chat-panes-${conversation.id}'),
+          drawer: hosted ? widget.host!.drawer(context) : _drawer,
+          allowDrawer: true,
+          menuStyle: state.appearance.mobileChatMenuStyle,
+          drawerOpen: _drawerOpen,
+          onDrawerOpen: _setPaneOpen,
+          onDrawerVisible: _setDrawerVisible,
+          asideOpen: _asideOpen,
+          hasAside: _aside.activeThread != null,
+          asideArrowOpacity: state.btwSettings.mainChatArrowOpacity,
+          onAsideOpen: _setAsideOpen,
+          onAsideVisible: (visible) {
+            if (_asideVisible != visible) {
+              setState(() => _asideVisible = visible);
+            }
+          },
+          asideWidth: _asideWidth,
+          onAsideResize: (w) => setState(() => _asideWidth = w),
+          aside: BtwThread(
+            controller: _aside,
+            ui: ui,
+            actionsEnabled: state.btwToolsEnabledFor(
+              _aside.activeThread,
+              conversation: conversation,
             ),
-        ],
+            onClose: _closeAside,
+          ),
+          child: chat,
+        ),
       ),
     );
+  }
+
+  /// Toggles the side-menu pane. The menu square is deliberately the primary
+  /// control: with no close chip, it both opens and closes the pane.
+  void _togglePane() => _setPaneOpen(!_drawerOpen);
+
+  void _setPaneOpen(bool open) {
+    if (open) FocusManager.instance.primaryFocus?.unfocus();
+    if (_drawerOpen == open && (!open || _drawerVisible)) return;
+    setState(() {
+      _drawerOpen = open;
+      // Opening is visible immediately. Closing leaves [_drawerVisible] set
+      // until the pane reports that it has actually left the screen.
+      if (open) _drawerVisible = true;
+    });
+  }
+
+  /// The pane's visibility boundary. Called only when geometry crosses zero or
+  /// a settle finishes — never on every drag or animation frame.
+  void _setDrawerVisible(bool visible) {
+    if (_drawerVisible == visible) return;
+    setState(() => _drawerVisible = visible);
   }
 
   /// The thread, the group bar and the composer, laid out one of two ways.
@@ -819,8 +1039,13 @@ class _ChatScreenState extends State<ChatScreen> {
   /// screen up — and everything to lose: it lurched the conversation on every
   /// frame of the keyboard's rise. Lifting one small, already-boundaried layer is
   /// a re-composite, not a screenful of relayout.
-  Widget _chatBody(AppState state, Conversation conversation, ChatInterface ui,
-      double topInset, bool floatingComposer) {
+  Widget _chatBody(
+    AppState state,
+    Conversation conversation,
+    ChatInterface ui,
+    double topInset,
+    bool floatingComposer,
+  ) {
     // Sits at the bottom-right of the thread, just above the composer, and only
     // while scrolled well up. For the floating composer it clears the dock.
     final jumpButton = Positioned(
@@ -839,10 +1064,7 @@ class _ChatScreenState extends State<ChatScreen> {
     );
 
     final thread = conversation.isEmpty
-        ? _EmptyState(
-            configured: state.isConfigured,
-            onSettings: _openSettings,
-          )
+        ? _EmptyState(configured: state.isConfigured, onSettings: _openSettings)
         : Stack(
             children: [
               // The thread is its own retained layer, so moving a floating picture
@@ -904,12 +1126,24 @@ class _ChatScreenState extends State<ChatScreen> {
     // and the strips above it animate open and shut; without a boundary each of
     // those repaints re-records the layer it shares with the chat's background
     // picture and everything floating over the thread.
-    final composer = RepaintBoundary(child: _composer(state));
+    // Wrapped in the slash panel's shortcuts: arrows/Tab/Enter/Escape reach the
+    // panel only while it shows (the map is empty otherwise), so the field's own
+    // keys are untouched the rest of the time.
+    final composer = RepaintBoundary(
+      child: ListenableBuilder(
+        listenable: _slash,
+        builder: (context, _) => CallbackShortcuts(
+          bindings: _slash.shortcuts,
+          child: _composer(state),
+        ),
+      ),
+    );
 
     if (!floatingComposer) {
       return Column(
         children: [
           Expanded(child: thread),
+          ?widget.host?.aboveComposer?.call(context),
           groupBar,
           composer,
         ],
@@ -944,7 +1178,11 @@ class _ChatScreenState extends State<ChatScreen> {
             child: RepaintBoundary(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
-                children: [groupBar, composer],
+                children: [
+                  ?widget.host?.aboveComposer?.call(context),
+                  groupBar,
+                  composer,
+                ],
               ),
             ),
           ),
@@ -953,17 +1191,33 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  Widget _messageList(Conversation conversation, AppState state, double top,
-      {double bottom = 8}) {
+  Widget _messageList(
+    Conversation conversation,
+    AppState state,
+    double top, {
+    double bottom = 8,
+  }) {
     final ui = state.interfaceFor(conversation);
-    final character = state.characterFor(conversation, conversation.characterId);
+    final character = state.characterFor(
+      conversation,
+      conversation.characterId,
+    );
     final persona = state.impersonationFor(conversation);
     // A cosmetic (display-only) regex pass, when any rule wants one. Null lets
     // every bubble draw its stored text directly. The fingerprint rides in each
     // bubble's cache signature so editing a rule refreshes the thread.
     final regexDisplay = state.regexDisplayTransform(conversation);
-    final regexToken = regexDisplay == null ? null : state.regexDisplaySignature;
-    return ListView.builder(
+    final regexToken = regexDisplay == null
+        ? null
+        : state.regexDisplaySignature;
+    final toolConfig = state.chatToolConfigFor(conversation);
+    final toolProjection = state.chatToolProjection(conversation);
+    final hiddenTools = state
+        .chatToolDefinitionsFor(conversation)
+        .where((d) => d.hidden)
+        .map((d) => d.name)
+        .toSet();
+    final list = ListView.builder(
       controller: _scroll,
       // Reversed so the newest turn sits at the bottom (offset 0) and the list
       // builds outward from it. A forward list jumped to its bottom forces
@@ -1005,15 +1259,16 @@ class _ChatScreenState extends State<ChatScreen> {
             : character;
         final userSpeaker =
             conversation.isGroup && message.isUser && message.speakerId != null
-                ? (state.characterFor(conversation, message.speakerId) ?? persona)
-                : persona;
+            ? (state.characterFor(conversation, message.speakerId) ?? persona)
+            : persona;
         // The picture each side wears *in this thread*, resolved in the one
         // place that decides it. Read here rather than inside the bubble so a
         // per-chat choice cannot be honoured here and forgotten elsewhere — and
         // so it is part of what tells this bubble apart from the one already
         // built below.
-        final avatarOverride =
-            speaker == null ? null : state.avatarRefFor(conversation, speaker);
+        final avatarOverride = speaker == null
+            ? null
+            : state.avatarRefFor(conversation, speaker);
         final userAvatarOverride = userSpeaker == null
             ? null
             : state.avatarRefFor(conversation, userSpeaker);
@@ -1034,6 +1289,10 @@ class _ChatScreenState extends State<ChatScreen> {
           pending,
           state.streaming,
           regexToken,
+          toolConfig.trackerPlacement,
+          toolConfig.hideToolCallsInChat,
+          hiddenTools.join('|'),
+          toolProjection.staleRuns.contains(message.toolRun?.id),
         ];
         final cached = editing ? null : _bubbles[msgIndex];
         if (cached != null && listEquals(cached.signature, signature)) {
@@ -1051,7 +1310,7 @@ class _ChatScreenState extends State<ChatScreen> {
               _openAvatar(state, conversation, isUser ? userSpeaker : speaker),
           onImageTap: (at) => showPictureViewer(
             context,
-            refs: [for (final image in message.images) image.ref],
+            refs: [for (final image in message.visibleImages) image.ref],
             index: at,
           ),
           pending: pending,
@@ -1067,12 +1326,57 @@ class _ChatScreenState extends State<ChatScreen> {
               ? null
               : () => _showMessageActions(state, conversation, msgIndex),
           displayTransform: regexDisplay,
+          belowContent:
+              toolConfig.trackerPlacement == 'message' &&
+                  (message.toolRun?.effects.any(
+                        (effect) =>
+                            effect.key.startsWith('tracker:') &&
+                            effect.after != null,
+                      ) ??
+                      false)
+              ? ChatTrackerPanel.fromRun(message.toolRun!)
+              : null,
         );
-        if (editing) return bubble;
+        // The user chose to keep the transcript clean: the run happened and is
+        // inspectable in View prompt, but nothing is drawn under the bubble.
+        final hideToolUi = toolConfig.hideToolCallsInChat;
+        final decorated = message.toolRun == null || hideToolUi
+            ? bubble
+            : Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  bubble,
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                    child: ChatToolResults(
+                      run: message.toolRun!,
+                      hiddenTools: hiddenTools,
+                      stale: toolProjection.staleRuns.contains(
+                        message.toolRun!.id,
+                      ),
+                      showTrackers: false,
+                    ),
+                  ),
+                ],
+              );
+        if (editing) return decorated;
         if (_bubbles.length >= _bubbleCacheMax) _bubbles.clear();
-        _bubbles[msgIndex] = _CachedBubble(signature, bubble);
-        return bubble;
+        _bubbles[msgIndex] = _CachedBubble(signature, decorated);
+        return decorated;
       },
+    );
+    if (toolConfig.trackerPlacement != 'pinned') return list;
+    return Column(
+      children: [
+        ChatTrackerPanel(
+          values: {
+            for (final e in toolProjection.values.entries)
+              if (e.key.startsWith('tracker:')) e.key.substring(8): e.value,
+          },
+        ),
+        Expanded(child: list),
+      ],
     );
   }
 
@@ -1081,9 +1385,7 @@ class _ChatScreenState extends State<ChatScreen> {
   /// becomes ✕/✓.
   void _startEditing(Conversation conversation, int index) {
     if (index < 0 || index >= conversation.messages.length) return;
-    _edit.value = TextEditingValue(
-      text: conversation.messages[index].content,
-    );
+    _edit.value = TextEditingValue(text: conversation.messages[index].content);
     setState(() => _editingIndex = index);
   }
 
@@ -1095,7 +1397,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
   /// Commits what was typed and leaves the editor.
   Future<void> _saveEdit(
-      AppState state, Conversation conversation, int index) async {
+    AppState state,
+    Conversation conversation,
+    int index,
+  ) async {
     final text = _edit.text;
     _stopEditing();
     await state.editMessage(conversation.id, index, text);
@@ -1133,7 +1438,8 @@ class _ChatScreenState extends State<ChatScreen> {
         _deleteMessage(state, conversation, index);
       case MessageAction.copy:
         Clipboard.setData(
-            ClipboardData(text: conversation.messages[index].content));
+          ClipboardData(text: conversation.messages[index].content),
+        );
         _toast('Copied');
       case MessageAction.fork:
         _forkFrom(state, conversation, index);
@@ -1175,9 +1481,9 @@ class _ChatScreenState extends State<ChatScreen> {
           span <= 1
               ? 'This message will be removed permanently.'
               : 'There ${span - 1 == 1 ? 'is' : 'are'} ${span - 1} '
-                  '${span - 1 == 1 ? 'message' : 'messages'} after this one. '
-                  'Delete this message on its own, or everything from here to '
-                  'the end of the chat?',
+                    '${span - 1 == 1 ? 'message' : 'messages'} after this one. '
+                    'Delete this message on its own, or everything from here to '
+                    'the end of the chat?',
         ),
         actions: [
           TextButton(
@@ -1197,8 +1503,9 @@ class _ChatScreenState extends State<ChatScreen> {
               backgroundColor: scheme.error,
               foregroundColor: scheme.onError,
             ),
-            onPressed: () => Navigator.of(dialog).pop(
-                span > 1 ? _DeleteScope.fromHere : _DeleteScope.thisMessage),
+            onPressed: () => Navigator.of(
+              dialog,
+            ).pop(span > 1 ? _DeleteScope.fromHere : _DeleteScope.thisMessage),
             child: Text(span > 1 ? 'Delete $span' : 'Delete'),
           ),
         ],
@@ -1213,11 +1520,20 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _forkFrom(
-      AppState state, Conversation conversation, int index) async {    await state.forkConversation(conversation.id, index);
+    AppState state,
+    Conversation conversation,
+    int index,
+  ) async {
+    await state.forkConversation(conversation.id, index);
     if (!mounted) return;
     // The fork joins this chat's tree rather than becoming a separate row in the
-    // lists, so the toast points at where it can be found.
-    _toast('Branched — see Chat Graph');
+    // lists, so the toast points at where it can be found. A hosted chat's
+    // branch is a chat of the host's, listed in its sidebar.
+    _toast(
+      widget.host == null
+          ? 'Branched — see Chat Graph'
+          : 'Branched — it is in the chat list',
+    );
     _stickToLatest();
   }
 
@@ -1303,8 +1619,10 @@ class _ChatScreenState extends State<ChatScreen> {
             ListTile(
               leading: const Icon(Icons.auto_awesome_outlined),
               title: const Text('Generate image'),
-              subtitle: const Text('Open the studio with this message as the '
-                  'prompt'),
+              subtitle: const Text(
+                'Open the studio with this message as the '
+                'prompt',
+              ),
               onTap: () {
                 Navigator.of(sheet).pop();
                 _openImageStudio(prompt: message.content);
@@ -1313,11 +1631,17 @@ class _ChatScreenState extends State<ChatScreen> {
             ListTile(
               leading: const Icon(Icons.call_split),
               title: const Text('Branch from here'),
-              subtitle: const Text('Carry on differently, in this chat\'s graph'),
+              subtitle: const Text(
+                'Carry on differently, in this chat\'s graph',
+              ),
               onTap: () async {
                 Navigator.of(sheet).pop();
                 await state.forkConversation(conversation.id, index);
-                _toast('Branched — see Chat Graph');
+                _toast(
+                  widget.host == null
+                      ? 'Branched — see Chat Graph'
+                      : 'Branched — it is in the chat list',
+                );
                 _scrollToEnd();
               },
             ),
@@ -1341,8 +1665,10 @@ class _ChatScreenState extends State<ChatScreen> {
               },
             ),
             ListTile(
-              leading: Icon(Icons.delete_outline,
-                  color: Theme.of(sheet).colorScheme.error),
+              leading: Icon(
+                Icons.delete_outline,
+                color: Theme.of(sheet).colorScheme.error,
+              ),
               title: const Text('Delete'),
               enabled: !state.streaming,
               onTap: () {
@@ -1367,11 +1693,13 @@ class _ChatScreenState extends State<ChatScreen> {
     // frame the composer builds so a settings change takes effect at once; the
     // controller keeps the last builder between keystrokes (buildTextSpan runs
     // without a parent rebuild), which is the same value, so nothing flickers.
-    final live = ui.composerStyle == ComposerStyle.expressive &&
+    final live =
+        ui.composerStyle == ComposerStyle.expressive &&
         ui.composerLiveFormatting &&
         ui.markdown;
-    _input.styleBuilder =
-        live ? (base) => _composerMarkdownStyles(ui, scheme, base) : null;
+    _input.styleBuilder = live
+        ? (base) => _composerMarkdownStyles(ui, scheme, base)
+        : null;
 
     // The expressive composer ditches the flat surface-and-divider slab the legacy
     // send bar sits on: its rounded box and the panels that rise out of it float
@@ -1381,10 +1709,15 @@ class _ChatScreenState extends State<ChatScreen> {
     // run reads as one shape rising from the box.
     final expressive = ui.composerStyle == ComposerStyle.expressive;
     final hintOpen = _showHintBar && state.responseHintEnabled;
-    final attachIsTop = expressive && _showAttachBar;
-    final hintIsTop = expressive && !_showAttachBar && hintOpen;
-    final opsIsTop = expressive && !_showAttachBar && !hintOpen && _showOps;
-    final panelAboveBox = expressive && (_showAttachBar || hintOpen || _showOps);
+    // The slash panel outranks every other riser: typing a command is the
+    // freshest intent, so it owns the rounded top of the merged stack.
+    final slashOpen = _slash.visible && _slash.unknownName == null;
+    final attachIsTop = expressive && !slashOpen && _showAttachBar;
+    final hintIsTop = expressive && !slashOpen && !_showAttachBar && hintOpen;
+    final opsIsTop =
+        expressive && !slashOpen && !_showAttachBar && !hintOpen && _showOps;
+    final panelAboveBox =
+        expressive && (slashOpen || _showAttachBar || hintOpen || _showOps);
     return Container(
       padding: expressive
           ? const EdgeInsets.fromLTRB(8, 6, 8, 10)
@@ -1398,6 +1731,31 @@ class _ChatScreenState extends State<ChatScreen> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
+          // The `/`-command suggestion list, above every other riser: typing
+          // a command is the freshest intent on the composer. Rises out of
+          // the box like the other panels — in the expressive composer it
+          // overlays the thread, in the legacy one it sits in the column.
+          AnimatedSize(
+            duration: const Duration(milliseconds: 200),
+            curve: Curves.easeOutCubic,
+            alignment: Alignment.bottomCenter,
+            child: ListenableBuilder(
+              listenable: _slash,
+              builder: (context, _) => !_slash.visible
+                  ? const SizedBox(width: double.infinity)
+                  : _maybeRiser(
+                      expressive: expressive,
+                      roundTop: slashOpen,
+                      outline: ui.composerOutline,
+                      scheme: scheme,
+                      child: StudioSlashPanel(
+                        matches: _slash.matches,
+                        highlighted: _slash.highlighted,
+                        onPick: _slash.complete,
+                      ),
+                    ),
+            ),
+          ),
           // The attachment tray sits **above** the operations strip, not between
           // it and the send bar: what is about to be sent belongs at the top of
           // the stack, with the controls that change it underneath, so a growing
@@ -1486,90 +1844,102 @@ class _ChatScreenState extends State<ChatScreen> {
                         padding: expressive
                             ? const EdgeInsets.fromLTRB(6, 4, 6, 4)
                             : const EdgeInsets.only(bottom: 6, right: 4),
-                      // Seven symbols is more than a narrow phone can fit at a
-                      // full 48dp touch target each, and a Row that overflows
-                      // simply clips whatever hangs off the end. Anchored to the
-                      // right (`reverse`), so the tools keep their places under
-                      // the ⋯ and it is the far end that can be slid into view
-                      // rather than lost.
-                      child: SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        reverse: true,
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            // Asking for a turn: kept together, and to the left
-                            // of the tools so those stay exactly where they have
-                            // always been.
-                            _TurnActions(
-                              busy: state.streaming,
-                              canContinue:
-                                  state.continuableIndex(conversation) != null,
-                              canRespond: state.canRespondAgain(conversation),
-                              onContinue: () => _continueReply(state),
-                              onRespondAgain: () => _respondAgain(state),
-                              onWriteForMe: () => _writeForMe(state),
-                            ),
-                            // Two families of action, told apart by a hairline
-                            // rather than by guesswork.
-                            Padding(
-                              padding: const EdgeInsets.symmetric(horizontal: 4),
-                              child: SizedBox(
-                                height: 24,
-                                child: VerticalDivider(
-                                  width: 1,
-                                  thickness: 1,
-                                  color: scheme.outlineVariant,
+                        // Seven symbols is more than a narrow phone can fit at a
+                        // full 48dp touch target each, and a Row that overflows
+                        // simply clips whatever hangs off the end. Anchored to the
+                        // right (`reverse`), so the tools keep their places under
+                        // the ⋯ and it is the far end that can be slid into view
+                        // rather than lost.
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          reverse: true,
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              // Asking for a turn: kept together, and to the left
+                              // of the tools so those stay exactly where they have
+                              // always been.
+                              _TurnActions(
+                                busy: state.streaming,
+                                canContinue:
+                                    state.continuableIndex(conversation) !=
+                                    null,
+                                canRespond: state.canRespondAgain(conversation),
+                                onContinue: () => _continueReply(state),
+                                onRespondAgain: () => _respondAgain(state),
+                                onWriteForMe: () => _writeForMe(state),
+                              ),
+                              // Two families of action, told apart by a hairline
+                              // rather than by guesswork.
+                              Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 4,
+                                ),
+                                child: SizedBox(
+                                  height: 24,
+                                  child: VerticalDivider(
+                                    width: 1,
+                                    thickness: 1,
+                                    color: scheme.outlineVariant,
+                                  ),
                                 ),
                               ),
-                            ),
-                            // Steering for the next reply. Placed at the left of
-                            // the tools rather than the right: the strip is
-                            // anchored to the ⋯ button, so growing it leftwards
-                            // leaves every symbol that was already here exactly
-                            // where the thumb learned to find it.
-                            if (state.responseHintEnabled)
+                              // Steering for the next reply. Placed at the left of
+                              // the tools rather than the right: the strip is
+                              // anchored to the ⋯ button, so growing it leftwards
+                              // leaves every symbol that was already here exactly
+                              // where the thumb learned to find it.
+                              if (state.responseHintEnabled)
+                                IconButton(
+                                  key: const Key('composer-hint-button'),
+                                  tooltip: 'Response hint',
+                                  isSelected: _showHintBar,
+                                  onPressed: () => setState(() {
+                                    _showHintBar = !_showHintBar;
+                                    if (!_showHintBar) _flushHint();
+                                  }),
+                                  // Lit when something is typed, so a closed box
+                                  // still says the next reply is being steered.
+                                  icon: Icon(
+                                    _hintActive
+                                        ? Icons.tips_and_updates
+                                        : Icons.tips_and_updates_outlined,
+                                  ),
+                                ),
                               IconButton(
-                                key: const Key('composer-hint-button'),
-                                tooltip: 'Response hint',
-                                isSelected: _showHintBar,
-                                onPressed: () => setState(() {
-                                  _showHintBar = !_showHintBar;
-                                  if (!_showHintBar) _flushHint();
-                                }),
-                                // Lit when something is typed, so a closed box
-                                // still says the next reply is being steered.
-                                icon: Icon(_hintActive
-                                    ? Icons.tips_and_updates
-                                    : Icons.tips_and_updates_outlined),
+                                key: const Key('composer-image-button'),
+                                tooltip: 'Send a picture',
+                                isSelected: _showAttachBar,
+                                onPressed: () => setState(
+                                  () => _showAttachBar = !_showAttachBar,
+                                ),
+                                icon: const Icon(Icons.image_outlined),
                               ),
-                            IconButton(
-                              key: const Key('composer-image-button'),
-                              tooltip: 'Send a picture',
-                              isSelected: _showAttachBar,
-                              onPressed: () => setState(
-                                  () => _showAttachBar = !_showAttachBar),
-                              icon: const Icon(Icons.image_outlined),
-                            ),
-                            IconButton(
-                              key: const Key('composer-imagegen-button'),
-                              tooltip: 'Image studio',
-                              onPressed: () => _openImageStudio(),
-                              icon: const Icon(Icons.auto_awesome_outlined),
-                            ),
-                            if (groupEnabled)
                               IconButton(
-                                key: const Key('composer-group-button'),
-                                tooltip: conversation.isGroup
-                                    ? 'Group participants'
-                                    : 'Start a group chat',
-                                isSelected: _showGroupBar,
-                                onPressed: () => _toggleGroupBar(state),
-                                icon: const Icon(Icons.groups_outlined),
+                                key: const Key('composer-imagegen-button'),
+                                tooltip: 'Image studio',
+                                onPressed: () => _openImageStudio(),
+                                icon: const Icon(Icons.auto_awesome_outlined),
                               ),
-                          ],
+                              if (groupEnabled)
+                                IconButton(
+                                  key: const Key('composer-group-button'),
+                                  tooltip: conversation.isGroup
+                                      ? 'Group participants'
+                                      : 'Start a group chat',
+                                  isSelected: _showGroupBar,
+                                  onPressed: () => _toggleGroupBar(state),
+                                  icon: const Icon(Icons.groups_outlined),
+                                ),
+                              // A host's own symbols (the Studio's way back to
+                              // its areas), nearest the ⋯ that opened them.
+                              for (final action
+                                  in widget.host?.composerActions ??
+                                      const <WidgetBuilder>[])
+                                action(context),
+                            ],
+                          ),
                         ),
-                      ),
                       ),
                     ),
                   ),
@@ -1610,8 +1980,10 @@ class _ChatScreenState extends State<ChatScreen> {
                   ? 'Message'
                   : 'Message as ${persona.displayName}',
               isDense: true,
-              contentPadding:
-                  const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 14,
+                vertical: 12,
+              ),
             ),
           ),
         ),
@@ -1642,9 +2014,14 @@ class _ChatScreenState extends State<ChatScreen> {
   /// of the box; the box then squares off its own top corners so it merges into
   /// the single rounded shape the panels form above it.
   Widget _expressiveComposerBox(
-      AppState state, ChatInterface ui, Character? persona, bool panelAbove) {
+    AppState state,
+    ChatInterface ui,
+    Character? persona,
+    bool panelAbove,
+  ) {
     final scheme = Theme.of(context).colorScheme;
-    final personaName = persona?.displayName ??
+    final personaName =
+        persona?.displayName ??
         (ui.userName.trim().isEmpty ? 'You' : ui.userName.trim());
     const rounded = Radius.circular(28);
     final topRadius = panelAbove ? Radius.zero : rounded;
@@ -1666,8 +2043,9 @@ class _ChatScreenState extends State<ChatScreen> {
       case ComposerBackground.color:
         if (ui.composerBackgroundColor != null) {
           background = ColoredBox(
-            color:
-                Color(ui.composerBackgroundColor!).withValues(alpha: opacity),
+            color: Color(
+              ui.composerBackgroundColor!,
+            ).withValues(alpha: opacity),
           );
         }
       case ComposerBackground.image:
@@ -1833,12 +2211,14 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-
   /// built to match how the same text renders in a bubble (see
   /// [MessageBubble]'s inline renderer) so what is typed previews as what will
   /// be shown. [base] is the field's own resolved text style.
   MarkdownStyles _composerMarkdownStyles(
-      ChatInterface ui, ColorScheme scheme, TextStyle base) {
+    ChatInterface ui,
+    ColorScheme scheme,
+    TextStyle base,
+  ) {
     final color = base.color ?? scheme.onSurface;
     return MarkdownStyles(
       base: base,
@@ -1890,7 +2270,8 @@ class _ChatScreenState extends State<ChatScreen> {
     final character = choice.character!;
     final ok = await _confirm(
       title: 'Impersonate?',
-      body: 'Do you want to impersonate ${character.displayName}? Your messages '
+      body:
+          'Do you want to impersonate ${character.displayName}? Your messages '
           'will be sent as this character.',
       action: 'Impersonate',
     );
@@ -1899,35 +2280,49 @@ class _ChatScreenState extends State<ChatScreen> {
     if (mounted) _toast('Now impersonating ${character.displayName}.');
   }
 
-  /// Doubles as the stop control while a reply is streaming.
+  /// Doubles as the stop control while a reply is streaming — except while
+  /// the box holds a `/btw` line, which can be asked mid-reply: then it asks.
   Widget _sendButton(AppState state) {
     final scheme = Theme.of(context).colorScheme;
-    if (state.streaming) {
-      return IconButton.filled(
-        tooltip: 'Stop',
-        onPressed: state.stop,
-        style: IconButton.styleFrom(
-          backgroundColor: scheme.error,
-          foregroundColor: scheme.onError,
-        ),
-        icon: const Icon(Icons.stop),
-      );
-    }
     return ValueListenableBuilder<TextEditingValue>(
       valueListenable: _input,
-      builder: (context, value, _) => IconButton.filled(
-        tooltip: 'Send',
-        // A picture on its own is a message: Send stays live with an empty box
-        // as long as something is attached.
-        onPressed: value.text.trim().isEmpty && _attachments.isEmpty
-            ? null
-            : () => _send(state),
-        icon: const Icon(Icons.arrow_upward),
-      ),
+      builder: (context, value, _) {
+        if (btwQuestion(value.text) != null) {
+          return IconButton.filled(
+            key: const Key('chat-ask-aside'),
+            tooltip: 'Ask on the side',
+            onPressed: () => _send(state),
+            style: IconButton.styleFrom(
+              backgroundColor: scheme.tertiary,
+              foregroundColor: scheme.onTertiary,
+            ),
+            icon: const Icon(Icons.tips_and_updates_outlined),
+          );
+        }
+        if (state.streaming) {
+          return IconButton.filled(
+            tooltip: 'Stop',
+            onPressed: state.stop,
+            style: IconButton.styleFrom(
+              backgroundColor: scheme.error,
+              foregroundColor: scheme.onError,
+            ),
+            icon: const Icon(Icons.stop),
+          );
+        }
+        return IconButton.filled(
+          tooltip: 'Send',
+          // A picture on its own is a message: Send stays live with an empty
+          // box as long as something is attached.
+          onPressed: value.text.trim().isEmpty && _attachments.isEmpty
+              ? null
+              : () => _send(state),
+          icon: const Icon(Icons.arrow_upward),
+        );
+      },
     );
   }
 }
-// APPEND-MARKER-2
 
 /// The composer's text controller, extended to paint the field's contents with
 /// live inline-markdown formatting as it is typed.
@@ -1955,10 +2350,15 @@ class _ComposerController extends TextEditingController {
   }) {
     final build = styleBuilder;
     final composing =
-        withComposing && value.isComposingRangeValid && !value.composing.isCollapsed;
+        withComposing &&
+        value.isComposingRangeValid &&
+        !value.composing.isCollapsed;
     if (build == null || text.isEmpty || composing) {
-      return super
-          .buildTextSpan(context: context, style: style, withComposing: withComposing);
+      return super.buildTextSpan(
+        context: context,
+        style: style,
+        withComposing: withComposing,
+      );
     }
     final base = style ?? const TextStyle();
     return TextSpan(
@@ -2200,16 +2600,19 @@ class _HintBar extends StatelessWidget {
                 hintText: 'Guide the next reply…',
                 isDense: true,
                 border: border,
-                contentPadding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
                 // Where the hint lands, as the field's own helper line — so it
                 // lines up under the words it belongs to without a layout of its
                 // own, and the box does not change height when the depth does.
                 helperText: depth == 0
                     ? 'Just before the reply'
                     : '$depth ${depth == 1 ? 'message' : 'messages'} back',
-                helperStyle: theme.textTheme.bodySmall
-                    ?.copyWith(color: faded.withValues(alpha: 0.8)),
+                helperStyle: theme.textTheme.bodySmall?.copyWith(
+                  color: faded.withValues(alpha: 0.8),
+                ),
               ),
             ),
           ),
@@ -2391,10 +2794,9 @@ class _AttachChoice extends StatelessWidget {
               const SizedBox(width: 8),
               Text(
                 label,
-                style: Theme.of(context)
-                    .textTheme
-                    .labelLarge
-                    ?.copyWith(color: color),
+                style: Theme.of(
+                  context,
+                ).textTheme.labelLarge?.copyWith(color: color),
               ),
             ],
           ),
@@ -2441,8 +2843,11 @@ class _AttachPreview extends StatelessWidget {
                 ? ColoredBox(
                     color: scheme.surfaceContainerHighest,
                     child: Center(
-                      child: Icon(Icons.broken_image_outlined,
-                          size: 20, color: scheme.onSurfaceVariant),
+                      child: Icon(
+                        Icons.broken_image_outlined,
+                        size: 20,
+                        color: scheme.onSurfaceVariant,
+                      ),
                     ),
                   )
                 : SmoothImage(image: provider, fit: BoxFit.cover),
@@ -2635,7 +3040,9 @@ class _ResponderMenu extends StatelessWidget {
       icon: Icon(
         // A filled marker when someone is on auto, so the bar shows at a glance
         // that sends won't wait for a chip tap.
-        current == null ? Icons.record_voice_over_outlined : Icons.record_voice_over,
+        current == null
+            ? Icons.record_voice_over_outlined
+            : Icons.record_voice_over,
         color: current == null ? null : scheme.primary,
       ),
       position: PopupMenuPosition.under,
@@ -2700,9 +3107,7 @@ class _GroupChip extends StatelessWidget {
         ? CharacterAvatar(character: character!, radius: 12)
         : Icon(Icons.person, size: 18, color: scheme.onSecondaryContainer);
     return Material(
-      color: highlight
-          ? scheme.primaryContainer
-          : scheme.secondaryContainer,
+      color: highlight ? scheme.primaryContainer : scheme.secondaryContainer,
       borderRadius: BorderRadius.circular(20),
       clipBehavior: Clip.antiAlias,
       shape: responder
@@ -2721,8 +3126,7 @@ class _GroupChip extends StatelessWidget {
             children: [
               leading,
               const SizedBox(width: 6),
-              Text(label,
-                  style: Theme.of(context).textTheme.labelLarge),
+              Text(label, style: Theme.of(context).textTheme.labelLarge),
               if (responder) ...[
                 const SizedBox(width: 6),
                 Icon(Icons.record_voice_over, size: 15, color: scheme.primary),
@@ -2844,8 +3248,9 @@ class _JumpToLatestButton extends StatelessWidget {
             children: [
               FloatingActionButton.small(
                 heroTag: null,
-                tooltip:
-                    live ? 'A reply is coming in — jump to it' : 'Jump to latest',
+                tooltip: live
+                    ? 'A reply is coming in — jump to it'
+                    : 'Jump to latest',
                 elevation: 2,
                 backgroundColor: live
                     ? scheme.primaryContainer
@@ -2863,8 +3268,10 @@ class _JumpToLatestButton extends StatelessWidget {
                   top: -4,
                   right: -4,
                   child: Container(
-                    constraints:
-                        const BoxConstraints(minWidth: 18, minHeight: 18),
+                    constraints: const BoxConstraints(
+                      minWidth: 18,
+                      minHeight: 18,
+                    ),
                     padding: const EdgeInsets.symmetric(horizontal: 5),
                     decoration: BoxDecoration(
                       color: scheme.error,
@@ -2891,14 +3298,830 @@ class _JumpToLatestButton extends StatelessWidget {
   }
 }
 
-/// Which face the chat sidebar is showing: its menu, or one of the panels that
-/// live *inside* the drawer. They replace the menu rather than being pushed as
-/// routes, so backing out of one returns to the menu with the drawer still open.
+/// On phones the menu translates a full-width chat out of the way. On larger
+/// screens both side panes reserve their space and leave the chat interactive.
+///
+/// The drawer has one normalized progress value. A finger assigns that value
+/// directly (no implicit tween chasing each delta); only releases and controls
+/// run a spring settle. This is what lets a drag pause exactly where the finger
+/// pauses, reverse with it, and catch an animation without a jump.
+class _ChatPanes extends StatefulWidget {
+  const _ChatPanes({
+    super.key,
+    required this.drawer,
+    required this.allowDrawer,
+    required this.menuStyle,
+    required this.drawerOpen,
+    required this.onDrawerOpen,
+    required this.onDrawerVisible,
+    required this.asideOpen,
+    required this.hasAside,
+    required this.asideArrowOpacity,
+    required this.onAsideOpen,
+    required this.onAsideVisible,
+    required this.asideWidth,
+    required this.onAsideResize,
+    required this.aside,
+    required this.child,
+  });
+
+  final Widget drawer;
+  final bool allowDrawer;
+  final MobileChatMenuStyle menuStyle;
+  final bool drawerOpen;
+  final ValueChanged<bool> onDrawerOpen;
+  final ValueChanged<bool> onDrawerVisible;
+  final bool asideOpen;
+  final bool hasAside;
+  final double asideArrowOpacity;
+  final ValueChanged<bool> onAsideOpen;
+  final ValueChanged<bool> onAsideVisible;
+  final double asideWidth;
+  final ValueChanged<double> onAsideResize;
+  final Widget aside;
+  final Widget child;
+
+  @override
+  State<_ChatPanes> createState() => _ChatPanesState();
+}
+
+class _ChatPanesState extends State<_ChatPanes> with TickerProviderStateMixin {
+  static const _duration = Duration(milliseconds: 240);
+  static const _spring = SpringDescription(
+    mass: 1,
+    stiffness: 420,
+    damping: 34,
+  );
+  static const _springTolerance = Tolerance(distance: 0.001, velocity: 0.01);
+  static const _flingVelocity = 400.0;
+
+  late final AnimationController _controller = AnimationController.unbounded(
+    vsync: this,
+    duration: _duration,
+  );
+  late final AnimationController _asideController =
+      AnimationController.unbounded(vsync: this, duration: _duration);
+  int? _asidePointer;
+  bool _asideRecognized = false;
+  bool _asideExternalCancel = false;
+  int _asideEpoch = 0;
+  bool _asideReportedOpen = false;
+  bool _asideReportedVisible = false;
+  double _actualAsideWidth = 1;
+  double _asideHandleTop = 56;
+
+  double get _asideProgress => _asideController.value.clamp(0.0, 1.0);
+  bool get _asidePresent =>
+      widget.hasAside &&
+      (_asideProgress > 0 || _asideController.isAnimating || widget.asideOpen);
+
+  // A pointer owns progress from its down event until up/cancel, even before
+  // horizontal slop has been crossed. The recognizer is not the owner: losing
+  // a vertical arena cannot take the pane away from a finger that is still on
+  // the glass.
+  int? _ownerPointer;
+  bool _recognizedDrag = false;
+  bool _externalCancel = false;
+  int _motionEpoch = 0;
+  bool _reportedOpen = false;
+  bool _reportedVisible = false;
+  double _drawerWidth = 1;
+  double _rootWidth = 1;
+  bool _rootWide = false;
+
+  double get _progress => _controller.value.clamp(0.0, 1.0);
+
+  @override
+  void initState() {
+    super.initState();
+    _controller.value = widget.drawerOpen ? 1.0 : 0.0;
+    _reportedOpen = widget.drawerOpen;
+    _reportedVisible = widget.drawerOpen;
+    _asideController.value = widget.asideOpen ? 1.0 : 0.0;
+    _asideReportedOpen = widget.asideOpen;
+    _asideReportedVisible = widget.asideOpen;
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    _asideController.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant _ChatPanes oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!widget.hasAside && oldWidget.hasAside) {
+      _asideEpoch++;
+      _asidePointer = null;
+      _asideController.stop();
+      _asideController.value = 0;
+      _reportAsideOpen(false);
+      _reportAsideVisible(false);
+    } else if (widget.asideOpen != _asideReportedOpen) {
+      _asideExternalCancel = _asidePointer != null;
+      _asideReportedOpen = widget.asideOpen;
+      _settleAside(widget.asideOpen);
+    }
+    if (widget.drawerOpen == _reportedOpen) return;
+    // Self-reported drag changes already match _reportedOpen. A different
+    // target is an external control, which takes priority over the held touch.
+    _externalCancel = _ownerPointer != null;
+    _reportedOpen = widget.drawerOpen;
+    _settleTo(widget.drawerOpen);
+  }
+
+  void _reportOpen(bool open) {
+    if (_reportedOpen == open) return;
+    _reportedOpen = open;
+    _scheduleNotification(() {
+      if (_reportedOpen == open) widget.onDrawerOpen(open);
+    });
+  }
+
+  void _reportVisible(bool visible) {
+    if (_reportedVisible == visible) return;
+    _reportedVisible = visible;
+    _scheduleNotification(() {
+      if (_reportedVisible == visible) widget.onDrawerVisible(visible);
+    });
+  }
+
+  void _scheduleNotification(VoidCallback callback) {
+    if (!mounted) return;
+    scheduleMicrotask(() {
+      if (mounted) callback();
+    });
+  }
+
+  void _reportAsideOpen(bool open) {
+    if (_asideReportedOpen == open) return;
+    _asideReportedOpen = open;
+    _scheduleNotification(() {
+      if (_asideReportedOpen == open) widget.onAsideOpen(open);
+    });
+  }
+
+  void _reportAsideVisible(bool visible) {
+    if (_asideReportedVisible == visible) return;
+    _asideReportedVisible = visible;
+    _scheduleNotification(() {
+      if (_asideReportedVisible == visible) widget.onAsideVisible(visible);
+    });
+  }
+
+  bool _canStartAsideDrag(PointerDownEvent event) {
+    if (!widget.hasAside ||
+        (_asidePointer != null && _asidePointer != event.pointer) ||
+        _ownerPointer != null) {
+      return false;
+    }
+    if (!_rootWide && (_progress > 0 || widget.drawerOpen)) return false;
+    final point = event.localPosition;
+    if (point.dy < _asideHandleTop || point.dy > _asideHandleTop + 48) {
+      return false;
+    }
+    final left = _asidePresent
+        ? _rootWidth - _actualAsideWidth * _asideProgress + (_rootWide ? 12 : 0)
+        : _rootWidth - 48;
+    return point.dx >= left && point.dx <= left + 48;
+  }
+
+  void _asidePressed(PointerDownEvent event) {
+    if (!_canStartAsideDrag(event)) return;
+    _asidePointer = event.pointer;
+    _asideRecognized = false;
+    _asideExternalCancel = false;
+    _asideEpoch++;
+    _asideController.stop();
+    if (_asideProgress > 0) {
+      _reportAsideOpen(true);
+      _reportAsideVisible(true);
+    }
+  }
+
+  void _asideReleased(PointerEvent event) {
+    if (_asidePointer != event.pointer || _asideRecognized) return;
+    scheduleMicrotask(() {
+      if (_asidePointer != event.pointer) return;
+      _asidePointer = null;
+      if (!_asideExternalCancel) _settleAside(_asideProgress >= .5);
+      _asideExternalCancel = false;
+    });
+  }
+
+  void _asideCancelled(PointerCancelEvent event) {
+    if (_asidePointer != event.pointer) return;
+    _asidePointer = null;
+    _asideRecognized = false;
+    if (!_asideExternalCancel) _settleAside(_asideProgress >= .5);
+    _asideExternalCancel = false;
+  }
+
+  void _asideDragStarted(DragStartDetails details) {
+    if (_asidePointer == null || _asideExternalCancel) return;
+    _asideRecognized = true;
+    _asideEpoch++;
+    _asideController.stop();
+  }
+
+  void _asideDragUpdated(DragUpdateDetails details) {
+    if (_asidePointer == null || _asideExternalCancel) return;
+    final after = (_asideProgress - details.delta.dx / _actualAsideWidth).clamp(
+      0.0,
+      1.0,
+    );
+    _asideController.value = after;
+    if (after > 0) {
+      _reportAsideOpen(true);
+      _reportAsideVisible(true);
+    }
+  }
+
+  void _asideDragEnded(DragEndDetails details) {
+    if (_asidePointer == null) return;
+    _asidePointer = null;
+    _asideRecognized = false;
+    if (_asideExternalCancel) {
+      _asideExternalCancel = false;
+      return;
+    }
+    final velocity = details.primaryVelocity ?? 0;
+    final target = velocity.abs() > _flingVelocity
+        ? velocity < 0
+        : _asideProgress >= .5;
+    _settleAside(target, velocity: -velocity / _actualAsideWidth);
+  }
+
+  void _settleAside(bool target, {double velocity = 0}) {
+    final epoch = ++_asideEpoch;
+    _asideController.stop();
+    _reportAsideOpen(target);
+    if (target) _reportAsideVisible(true);
+    final end = target ? 1.0 : 0.0;
+    if (MediaQuery.disableAnimationsOf(context) ||
+        (_asideProgress - end).abs() < .00001) {
+      _asideController.value = end;
+      _reportAsideVisible(target);
+      return;
+    }
+    _asideController
+        .animateWith(
+          SpringSimulation(
+            _spring,
+            _asideProgress,
+            end,
+            velocity,
+            snapToEnd: true,
+            tolerance: _springTolerance,
+          ),
+        )
+        .whenCompleteOrCancel(() {
+          if (!mounted || epoch != _asideEpoch) return;
+          _asideController.value = end;
+          _reportAsideVisible(target);
+        });
+  }
+
+  bool _canStartDrag(PointerDownEvent event) {
+    if (!widget.allowDrawer) return false;
+    if (_ownerPointer != null && _ownerPointer != event.pointer) return false;
+    final local = event.localPosition;
+    if (local.dx < 0 || local.dx > _rootWidth) return false;
+    if (!_rootWide && _asidePresent) return false;
+    final shown = _drawerWidth * _progress;
+    if (shown == 0) return local.dx < 20;
+    return !_rootWide || local.dx <= shown;
+  }
+
+  void _pointerPressed(PointerDownEvent event) {
+    if (_ownerPointer != null || !_canStartDrag(event)) return;
+    _ownerPointer = event.pointer;
+    _recognizedDrag = false;
+    _externalCancel = false;
+    _motionEpoch++;
+    _controller.stop();
+    if (_progress > 0) {
+      _reportOpen(true);
+      _reportVisible(true);
+    }
+  }
+
+  void _pointerReleased(PointerEvent event) {
+    if (_ownerPointer != event.pointer) return;
+    if (_recognizedDrag) return;
+    // Do not race the recognizer's velocity callback. If the pointer was never
+    // recognized (a tap or a vertical scroll), settle from the held position.
+    scheduleMicrotask(() {
+      if (_ownerPointer != event.pointer) return;
+      _ownerPointer = null;
+      if (!_externalCancel) _settleTo(_settleToNearest());
+      _externalCancel = false;
+    });
+  }
+
+  void _pointerCancelled(PointerCancelEvent event) {
+    if (_ownerPointer != event.pointer) return;
+    _ownerPointer = null;
+    _recognizedDrag = false;
+    if (!_externalCancel) _settleTo(_settleToNearest());
+    _externalCancel = false;
+  }
+
+  bool _settleToNearest() => _progress >= .5;
+
+  void _dragStarted(DragStartDetails details) {
+    if (_ownerPointer == null || _externalCancel) return;
+    _recognizedDrag = true;
+    _motionEpoch++;
+    _controller.stop();
+  }
+
+  void _dragUpdated(DragUpdateDetails details) {
+    if (_ownerPointer == null || _externalCancel) return;
+    final after = (_progress + details.delta.dx / _drawerWidth).clamp(0.0, 1.0);
+    _controller.value = after;
+    if (after > 0) {
+      _reportOpen(true);
+      _reportVisible(true);
+    }
+  }
+
+  void _dragEnded(DragEndDetails details) {
+    if (_ownerPointer == null) return;
+    _ownerPointer = null;
+    _recognizedDrag = false;
+    if (_externalCancel) {
+      _externalCancel = false;
+      return;
+    }
+    final velocity = details.primaryVelocity ?? 0.0;
+    final bool target;
+    if (velocity > _flingVelocity) {
+      target = true;
+    } else if (velocity < -_flingVelocity) {
+      target = false;
+    } else {
+      target = _settleToNearest();
+    }
+    _settleTo(target, velocity: velocity / _drawerWidth);
+  }
+
+  void _dragCancelled() {
+    // A child can win the vertical/tap arena before the pointer lifts. Keep
+    // its down-hold until the physical up/cancel event releases ownership.
+    _recognizedDrag = false;
+  }
+
+  void _settleTo(bool target, {double velocity = 0}) {
+    final epoch = ++_motionEpoch;
+    _controller.stop();
+    _reportOpen(target);
+    if (target) {
+      _reportVisible(true);
+    } else if (_progress <= _springTolerance.distance &&
+        _ownerPointer == null) {
+      _reportVisible(false);
+    }
+    final end = target ? 1.0 : 0.0;
+    if (MediaQuery.disableAnimationsOf(context) ||
+        (_progress - end).abs() < .00001) {
+      _controller.value = end;
+      _reportVisible(target);
+      return;
+    }
+    _controller
+        .animateWith(
+          SpringSimulation(
+            _spring,
+            _progress,
+            end,
+            velocity,
+            snapToEnd: true,
+            tolerance: _springTolerance,
+          ),
+        )
+        .whenCompleteOrCancel(() {
+          if (!mounted || epoch != _motionEpoch) return;
+          _controller.value = end;
+          _reportVisible(target);
+        });
+  }
+
+  void _close() {
+    _externalCancel = _ownerPointer != null;
+    _settleTo(false);
+  }
+
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      final width = constraints.maxWidth;
+      final wide = width >= 720;
+      final slide = wide || widget.menuStyle == MobileChatMenuStyle.slide;
+      _rootWide = wide;
+      _rootWidth = width;
+      _asideHandleTop = MediaQuery.viewPaddingOf(context).top + 56;
+      _drawerWidth = wide ? width * .25 : width * .78;
+      final scheme = Theme.of(context).colorScheme;
+      final arrowAlpha = widget.asideArrowOpacity.clamp(0.1, 1.0);
+
+      final drawerLayer = RepaintBoundary(
+        child: _PaneScope(
+          close: _close,
+          child: Material(
+            key: const Key('chat-drawer-pane'),
+            color: scheme.surface,
+            child: widget.drawer,
+          ),
+        ),
+      );
+      final chat = RepaintBoundary(
+        key: const Key('chat-main-pane'),
+        child: Stack(
+          children: [
+            Positioned.fill(child: widget.child),
+            if (widget.hasAside && !widget.asideOpen)
+              Positioned(
+                top: _asideHandleTop,
+                right: 0,
+                child: Semantics(
+                  hint: 'Drag left to reopen the side thread',
+                  child: Material(
+                    color: scheme.surfaceContainerHigh.withValues(
+                      alpha: arrowAlpha,
+                    ),
+                    surfaceTintColor: Colors.transparent,
+                    shadowColor: scheme.shadow.withValues(alpha: arrowAlpha),
+                    elevation: 2,
+                    borderRadius: const BorderRadius.horizontal(
+                      left: Radius.circular(12),
+                    ),
+                    clipBehavior: Clip.antiAlias,
+                    child: IconButton(
+                      key: const Key('btw-reopen'),
+                      constraints: const BoxConstraints.tightFor(
+                        width: 48,
+                        height: 48,
+                      ),
+                      tooltip: 'Reopen /btw thread',
+                      onPressed: () => widget.onAsideOpen(true),
+                      icon: Icon(
+                        Icons.chevron_left,
+                        color: scheme.onSurface.withValues(alpha: arrowAlpha),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      );
+      final motion = Listenable.merge([_controller, _asideController]);
+      final asideLayer = RepaintBoundary(
+        child: ExcludeFocus(
+          excluding: !_asideReportedOpen,
+          child: ExcludeSemantics(
+            excluding: !_asideReportedOpen,
+            child: IgnorePointer(
+              ignoring: !_asideReportedOpen,
+              child: widget.aside,
+            ),
+          ),
+        ),
+      );
+
+      final Widget body;
+      if (wide) {
+        body = AnimatedBuilder(
+          animation: motion,
+          child: chat,
+          builder: (context, chatChild) {
+            final progress = _progress;
+            final menuWidth = _drawerWidth * progress;
+            final maximumAside = width - menuWidth - 280;
+            final minimumAside = maximumAside.clamp(0.0, 280.0);
+            final actualAside = widget.asideWidth.clamp(
+              minimumAside,
+              maximumAside,
+            );
+            _actualAsideWidth = actualAside;
+            return Row(
+              children: [
+                SizedBox(
+                  width: menuWidth,
+                  child: menuWidth > 0
+                      ? ClipRect(
+                          child: OverflowBox(
+                            alignment: Alignment.centerRight,
+                            minWidth: _drawerWidth,
+                            maxWidth: _drawerWidth,
+                            child: drawerLayer,
+                          ),
+                        )
+                      : null,
+                ),
+                Expanded(child: chatChild!),
+                SizedBox(
+                  width: actualAside * _asideProgress,
+                  child: ClipRect(
+                    child: OverflowBox(
+                      alignment: Alignment.centerLeft,
+                      minWidth: actualAside,
+                      maxWidth: actualAside,
+                      child: _asidePresent
+                          ? Stack(
+                              children: [
+                                Positioned.fill(left: 12, child: asideLayer),
+                                Positioned(
+                                  left: 0,
+                                  top: 0,
+                                  bottom: 0,
+                                  width: 12,
+                                  child: Semantics(
+                                    label: 'Resize side thread',
+                                    slider: true,
+                                    onIncrease: () => widget.onAsideResize(
+                                      (actualAside + 40).clamp(
+                                        minimumAside,
+                                        maximumAside,
+                                      ),
+                                    ),
+                                    onDecrease: () => widget.onAsideResize(
+                                      (actualAside - 40).clamp(
+                                        minimumAside,
+                                        maximumAside,
+                                      ),
+                                    ),
+                                    child: MouseRegion(
+                                      cursor:
+                                          SystemMouseCursors.resizeLeftRight,
+                                      child: GestureDetector(
+                                        key: const Key('btw-resize-handle'),
+                                        behavior: HitTestBehavior.opaque,
+                                        onHorizontalDragUpdate: (d) =>
+                                            widget.onAsideResize(
+                                              (actualAside - d.delta.dx).clamp(
+                                                minimumAside,
+                                                maximumAside,
+                                              ),
+                                            ),
+                                        child: Center(
+                                          child: Container(
+                                            width: 4,
+                                            height: 40,
+                                            decoration: BoxDecoration(
+                                              color: scheme.outlineVariant,
+                                              borderRadius:
+                                                  BorderRadius.circular(4),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            )
+                          : null,
+                    ),
+                  ),
+                ),
+              ],
+            );
+          },
+        );
+      } else {
+        _actualAsideWidth = width;
+        body = AnimatedBuilder(
+          animation: motion,
+          child: chat,
+          builder: (context, chatChild) {
+            final progress = _progress;
+            final offset =
+                (slide ? _drawerWidth * progress : 0.0) -
+                width * _asideProgress;
+            final drawerLeft = slide
+                ? offset - _drawerWidth
+                : -_drawerWidth * (1 - progress);
+            final chatCovered = progress > 0 || _asidePresent;
+            return Stack(
+              clipBehavior: Clip.hardEdge,
+              children: [
+                Positioned(
+                  left: 0,
+                  top: 0,
+                  bottom: 0,
+                  width: width,
+                  child: ExcludeFocus(
+                    excluding: chatCovered,
+                    child: ExcludeSemantics(
+                      excluding: chatCovered,
+                      child: IgnorePointer(
+                        ignoring: chatCovered,
+                        child: Transform.translate(
+                          offset: Offset(offset, 0),
+                          child: chatChild!,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                if (progress > 0)
+                  Positioned(
+                    left: 0,
+                    top: 0,
+                    bottom: 0,
+                    width: _drawerWidth,
+                    child: Transform.translate(
+                      offset: Offset(drawerLeft, 0),
+                      child: drawerLayer,
+                    ),
+                  ),
+                if (progress > 0)
+                  Positioned(
+                    left: _drawerWidth * progress,
+                    top: 0,
+                    bottom: 0,
+                    right: 0,
+                    child: GestureDetector(
+                      key: const Key('chat-drawer-scrim'),
+                      behavior: HitTestBehavior.opaque,
+                      onTap: _close,
+                      child: Semantics(
+                        label: 'Close menu',
+                        button: true,
+                        child: const ColoredBox(color: Color(0x52000000)),
+                      ),
+                    ),
+                  ),
+              ],
+            );
+          },
+        );
+      }
+
+      return Listener(
+        behavior: HitTestBehavior.opaque,
+        onPointerDown: (event) {
+          _pointerPressed(event);
+          _asidePressed(event);
+        },
+        onPointerUp: (event) {
+          _pointerReleased(event);
+          _asideReleased(event);
+        },
+        onPointerCancel: (event) {
+          _pointerCancelled(event);
+          _asideCancelled(event);
+        },
+        child: RawGestureDetector(
+          behavior: HitTestBehavior.translucent,
+          excludeFromSemantics: true,
+          gestures: {
+            _PaneDragRecognizer:
+                GestureRecognizerFactoryWithHandlers<_PaneDragRecognizer>(
+                  () => _PaneDragRecognizer(canStart: _canStartDrag),
+                  (recognizer) {
+                    recognizer
+                      ..dragStartBehavior = DragStartBehavior.down
+                      ..onStart = _dragStarted
+                      ..onUpdate = _dragUpdated
+                      ..onEnd = _dragEnded
+                      ..onCancel = _dragCancelled;
+                  },
+                ),
+            _AsideDragRecognizer:
+                GestureRecognizerFactoryWithHandlers<_AsideDragRecognizer>(
+                  () => _AsideDragRecognizer(canStart: _canStartAsideDrag),
+                  (recognizer) {
+                    recognizer
+                      ..dragStartBehavior = DragStartBehavior.down
+                      ..onStart = _asideDragStarted
+                      ..onUpdate = _asideDragUpdated
+                      ..onEnd = _asideDragEnded
+                      ..onCancel = () => _asideRecognized = false;
+                  },
+                ),
+          },
+          child: Stack(
+            clipBehavior: Clip.hardEdge,
+            children: [
+              Positioned.fill(child: body),
+              if (!wide)
+                Positioned.fill(
+                  child: AnimatedBuilder(
+                    animation: _asideController,
+                    child: asideLayer,
+                    builder: (context, pane) => _asidePresent
+                        ? Transform.translate(
+                            offset: Offset(width * (1 - _asideProgress), 0),
+                            child: pane,
+                          )
+                        : const SizedBox.shrink(),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      );
+    },
+  );
+}
+
+class _PaneDragRecognizer extends HorizontalDragGestureRecognizer {
+  _PaneDragRecognizer({required this.canStart});
+
+  final bool Function(PointerDownEvent event) canStart;
+
+  @override
+  bool isPointerAllowed(PointerEvent event) {
+    if (event is! PointerDownEvent) return false;
+    return canStart(event) && super.isPointerAllowed(event);
+  }
+}
+
+class _AsideDragRecognizer extends _PaneDragRecognizer {
+  _AsideDragRecognizer({required super.canStart});
+}
+
+/// Lets widgets inside the pane drawer close the pane itself (the modal
+/// drawer used to pop the route; the pane cannot).
+class _PaneScope extends InheritedWidget {
+  const _PaneScope({required this.close, required super.child});
+
+  final VoidCallback close;
+
+  @override
+  bool updateShouldNotify(_PaneScope old) => close != old.close;
+}
+
+/// A single rounded destination in the chat sidebar, optionally with a quiet
+/// second line (used to show the active provider and model).
+class _ChatNavItem extends StatelessWidget {
+  const _ChatNavItem({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+    this.subtitle,
+  });
+
+  final IconData icon;
+  final String label;
+  final String? subtitle;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: ListTile(
+        leading: Icon(icon, color: scheme.onSurfaceVariant),
+        title: Text(
+          label,
+          style: Theme.of(context).textTheme.labelLarge?.copyWith(
+            color: scheme.onSurface,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+        subtitle: subtitle == null
+            ? null
+            : Text(subtitle!, maxLines: 1, overflow: TextOverflow.ellipsis),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        onTap: onTap,
+      ),
+    );
+  }
+}
+
+/// One half of the "← Characters / ← Chats" back-navigation pair.
+class _BackNavButton extends StatelessWidget {
+  const _BackNavButton({required this.label, required this.onTap});
+
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return OutlinedButton.icon(
+      onPressed: onTap,
+      icon: const Icon(Icons.chevron_left, size: 18),
+      label: Text(label, overflow: TextOverflow.ellipsis),
+      style: OutlinedButton.styleFrom(
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+    );
+  }
+}
+
+/// The utility strip pinned to the bottom of the chat sidebar: icon-only chat
+/// actions, echoing agnai's footer row.
+/// Subpages stay inside the drawer, so Back returns to its menu.
 enum _DrawerPanel { menu, presets, memory }
-/// The chat sidebar. Mirrors agnai's chat menu: an editable chat title on top,
-/// jumps to the other sections, provider/model, and a utility row of chat
-/// actions (settings, image gen, export, restart, delete, notifications).
-/// "Preset" and "Memory" open in-drawer panels rather than navigating away.
+
 class _ChatDrawer extends StatefulWidget {
   const _ChatDrawer({
     required this.onProfile,
@@ -2936,22 +4159,22 @@ class _ChatDrawer extends StatefulWidget {
 
 class _ChatDrawerState extends State<_ChatDrawer> {
   _DrawerPanel _panel = _DrawerPanel.menu;
-
-  /// Which way the last panel change drilled — into a sub-panel (true) or back
-  /// to the menu (false) — so the switch slides in the matching direction.
   bool _forward = true;
 
-  /// Runs [action] after the drawer has closed, so the drawer does not sit
-  /// open behind whatever the action pushes or shows.
   void _close(BuildContext context, VoidCallback action) {
-    Navigator.of(context).pop();
+    final pane = context.getInheritedWidgetOfExactType<_PaneScope>();
+    if (pane != null) {
+      pane.close();
+    } else {
+      Navigator.of(context).pop();
+    }
     action();
   }
 
   void _show(_DrawerPanel panel) => setState(() {
-        _forward = panel != _DrawerPanel.menu;
-        _panel = panel;
-      });
+    _forward = panel != _DrawerPanel.menu;
+    _panel = panel;
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -2962,19 +4185,52 @@ class _ChatDrawerState extends State<_ChatDrawer> {
       case _DrawerPanel.memory:
         body = ChatMemoryPanel(onBack: () => _show(_DrawerPanel.menu));
       case _DrawerPanel.menu:
-        body = _menu(context);
+        body = Selector<AppState, _ChatMenuData>(
+          selector: (context, state) {
+            final conversation = state.active;
+            final provider = state.activeProvider;
+            final books = state.lorebooksFor(conversation);
+            final tree = buildFamilyTree(state.conversations, conversation.id);
+            return _ChatMenuData(
+              conversationId: conversation.id,
+              conversationTitle: conversation.isEmpty
+                  ? 'New chat'
+                  : conversation.title,
+              providerName: provider?.displayName ?? '',
+              providerKind: provider?.kind,
+              providerModel: provider?.model ?? '',
+              presetName: state.presetFor(conversation)?.displayName,
+              memoryCount: books.length,
+              graphSize: tree?.subtreeSize ?? 1,
+            );
+          },
+          builder: (context, data, _) => _ChatMenuBody(
+            data: data,
+            onEditChat: () => _close(context, widget.onEditChat),
+            onProfile: () => _close(context, widget.onProfile),
+            onCharacters: () => _close(context, widget.onCharacters),
+            onChats: () => _close(context, widget.onChats),
+            onGallery: () => _close(context, widget.onGallery),
+            onPreset: () => _show(_DrawerPanel.presets),
+            onMemory: () => _show(_DrawerPanel.memory),
+            onChatGraph: () => _close(context, widget.onChatGraph),
+            onProviderModel: () => _close(context, widget.onProviderModel),
+            onSettings: () => _close(context, widget.onSettings),
+            onImageGen: () => _close(context, widget.onImageGen),
+            onExport: () => _close(context, widget.onExport),
+            onRestart: () => _close(context, widget.onRestart),
+            onDelete: () => _close(context, widget.onDelete),
+            onNotifications: () => _close(context, widget.onNotifications),
+          ),
+        );
     }
 
-    // Slide + fade between the menu and a sub-panel so drilling in/out reads as
-    // one fluid movement instead of a hard cut. StackFit.expand hands each child
-    // the drawer's full, bounded size — the panels are Columns with Expanded, so
-    // an unconstrained Stack child would otherwise overflow.
     return Drawer(
       child: SafeArea(
         child: AnimatedSwitcher(
           duration: const Duration(milliseconds: 260),
           switchInCurve: Curves.easeOutCubic,
-          switchOutCurve: Curves.easeInCubic,
+          switchOutCurve: Curves.easeInSine,
           transitionBuilder: (child, animation) {
             final incoming = child.key == ValueKey(_panel);
             final dir = _forward ? 1.0 : -1.0;
@@ -2982,8 +4238,10 @@ class _ChatDrawerState extends State<_ChatDrawer> {
             return FadeTransition(
               opacity: animation,
               child: SlideTransition(
-                position: Tween<Offset>(begin: begin, end: Offset.zero)
-                    .animate(animation),
+                position: Tween<Offset>(
+                  begin: begin,
+                  end: Offset.zero,
+                ).animate(animation),
                 child: child,
               ),
             );
@@ -2991,218 +4249,221 @@ class _ChatDrawerState extends State<_ChatDrawer> {
           layoutBuilder: (currentChild, previousChildren) => Stack(
             fit: StackFit.expand,
             alignment: Alignment.topCenter,
-            children: [
-              ...previousChildren,
-              ?currentChild,
-            ],
+            children: [...previousChildren, ?currentChild],
           ),
           child: KeyedSubtree(key: ValueKey(_panel), child: body),
         ),
       ),
     );
   }
+}
 
-  Widget _menu(BuildContext context) {
-    final state = context.watch<AppState>();
+class _ChatMenuData {
+  const _ChatMenuData({
+    required this.conversationId,
+    required this.conversationTitle,
+    required this.providerName,
+    required this.providerKind,
+    required this.providerModel,
+    required this.presetName,
+    required this.memoryCount,
+    required this.graphSize,
+  });
+
+  final String conversationId;
+  final String conversationTitle;
+  final String providerName;
+  final ProviderKind? providerKind;
+  final String providerModel;
+  final String? presetName;
+  final int memoryCount;
+  final int graphSize;
+
+  @override
+  bool operator ==(Object other) =>
+      other is _ChatMenuData &&
+      other.conversationId == conversationId &&
+      other.conversationTitle == conversationTitle &&
+      other.providerName == providerName &&
+      other.providerKind == providerKind &&
+      other.providerModel == providerModel &&
+      other.presetName == presetName &&
+      other.memoryCount == memoryCount &&
+      other.graphSize == graphSize;
+
+  @override
+  int get hashCode => Object.hash(
+    conversationId,
+    conversationTitle,
+    providerName,
+    providerKind,
+    providerModel,
+    presetName,
+    memoryCount,
+    graphSize,
+  );
+}
+
+class _ChatMenuBody extends StatelessWidget {
+  const _ChatMenuBody({
+    required this.data,
+    required this.onEditChat,
+    required this.onProfile,
+    required this.onCharacters,
+    required this.onChats,
+    required this.onGallery,
+    required this.onPreset,
+    required this.onMemory,
+    required this.onChatGraph,
+    required this.onProviderModel,
+    required this.onSettings,
+    required this.onImageGen,
+    required this.onExport,
+    required this.onRestart,
+    required this.onDelete,
+    required this.onNotifications,
+  });
+
+  final _ChatMenuData data;
+  final VoidCallback onEditChat;
+  final VoidCallback onProfile;
+  final VoidCallback onCharacters;
+  final VoidCallback onChats;
+  final VoidCallback onGallery;
+  final VoidCallback onPreset;
+  final VoidCallback onMemory;
+  final VoidCallback onChatGraph;
+  final VoidCallback onProviderModel;
+  final VoidCallback onSettings;
+  final VoidCallback onImageGen;
+  final VoidCallback onExport;
+  final VoidCallback onRestart;
+  final VoidCallback onDelete;
+  final VoidCallback onNotifications;
+
+  @override
+  Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final conversation = state.active;
-    final active = state.activeProvider;
-    final model = active?.model.trim() ?? '';
-    final providerSubtitle = active == null
+    final model = data.providerModel.trim();
+    final providerSubtitle = data.providerKind == null
         ? 'No provider yet'
-        : '${active.displayName}${model.isEmpty ? '' : ' · $model'}';
-    final presetName = state.presetFor(conversation)?.displayName ?? 'Default';
-    // How much memory this chat is carrying, so the user can see it without
-    // opening the panel. Resolved through AppState so a deleted book is not
-    // counted.
-    final memoryCount = state.lorebooksFor(conversation).length;
-    final memorySubtitle =
-        memoryCount == 0 ? 'None' : '$memoryCount active';
-    // How many chats are in this one's fork tree, so the drawer says whether
-    // there is a graph worth opening before the user taps.
-    final treeSize =
-        buildFamilyTree(state.conversations, conversation.id)?.subtreeSize ?? 1;
-    final graphSubtitle = treeSize <= 1
+        : '${data.providerName}${model.isEmpty ? '' : ' · $model'}';
+    final presetName = data.presetName ?? 'Default';
+    final memorySubtitle = data.memoryCount == 0
+        ? 'None'
+        : '${data.memoryCount} active';
+    final graphSubtitle = data.graphSize <= 1
         ? 'No branches'
-        : '$treeSize chats · ${treeSize - 1} '
-            '${treeSize == 2 ? 'branch' : 'branches'}';
+        : '${data.graphSize} chats · ${data.graphSize - 1} '
+              '${data.graphSize == 2 ? 'branch' : 'branches'}';
 
     return Column(
-          children: [
-            // Editable chat title, like agnai's "edit character" header.
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
-              child: InkWell(
-                onTap: () => _close(context, widget.onEditChat),
-                borderRadius: BorderRadius.circular(10),
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
-                  child: Row(
-                    children: [
-                      Icon(Icons.edit_outlined, size: 18, color: scheme.primary),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Text(
-                          conversation.isEmpty ? 'New chat' : conversation.title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context)
-                              .textTheme
-                              .titleMedium
-                              ?.copyWith(fontWeight: FontWeight.w600),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-            const Divider(height: 1),
-            Expanded(
-              child: ListView(
-                padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+          child: InkWell(
+            onTap: onEditChat,
+            borderRadius: BorderRadius.circular(10),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+              child: Row(
                 children: [
-                  _ChatNavItem(
-                    icon: Icons.person_outline,
-                    label: 'Profile',
-                    onTap: () => _close(context, widget.onProfile),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 2),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: _BackNavButton(
-                            label: 'Characters',
-                            onTap: () => _close(context, widget.onCharacters),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: _BackNavButton(
-                            label: 'Chats',
-                            onTap: () => _close(context, widget.onChats),
-                          ),
-                        ),
-                      ],
+                  Icon(Icons.edit_outlined, size: 18, color: scheme.primary),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      data.conversationTitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
                     ),
-                  ),
-                  _ChatNavItem(
-                    icon: Icons.photo_library_outlined,
-                    label: 'Gallery',
-                    onTap: () => _close(context, widget.onGallery),
-                  ),
-                  _ChatNavItem(
-                    icon: Icons.edit_note_outlined,
-                    label: 'Edit Chat',
-                    onTap: () => _close(context, widget.onEditChat),
-                  ),
-                  _ChatNavItem(
-                    icon: Icons.tune_outlined,
-                    label: 'Preset',
-                    subtitle: presetName,
-                    onTap: () => _show(_DrawerPanel.presets),
-                  ),
-                  _ChatNavItem(
-                    icon: Icons.book_outlined,
-                    label: 'Memory',
-                    subtitle: memorySubtitle,
-                    onTap: () => _show(_DrawerPanel.memory),
-                  ),
-                  _ChatNavItem(
-                    icon: Icons.account_tree_outlined,
-                    label: 'Chat Graph',
-                    subtitle: graphSubtitle,
-                    onTap: () => _close(context, widget.onChatGraph),
-                  ),
-                  const SizedBox(height: 4),
-                  _ChatNavItem(
-                    icon: Icons.dns_outlined,
-                    label: 'Provider & model',
-                    subtitle: providerSubtitle,
-                    onTap: () => _close(context, widget.onProviderModel),
                   ),
                 ],
               ),
             ),
-            const Divider(height: 1),
-            _ChatDrawerFooter(
-              onSettings: () => _close(context, widget.onSettings),
-              onImageGen: () => _close(context, widget.onImageGen),
-              onExport: () => _close(context, widget.onExport),
-              onRestart: () => _close(context, widget.onRestart),
-              onDelete: () => _close(context, widget.onDelete),
-              onNotifications: () => _close(context, widget.onNotifications),
-            ),
-          ],
-        );
-  }
-}
-// APPEND-MARKER-3
-
-/// A single rounded destination in the chat sidebar, optionally with a quiet
-/// second line (used to show the active provider and model).
-class _ChatNavItem extends StatelessWidget {
-  const _ChatNavItem({
-    required this.icon,
-    required this.label,
-    required this.onTap,
-    this.subtitle,
-  });
-
-  final IconData icon;
-  final String label;
-  final String? subtitle;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 2),
-      child: ListTile(
-        leading: Icon(icon, color: scheme.onSurfaceVariant),
-        title: Text(
-          label,
-          style: Theme.of(context)
-              .textTheme
-              .labelLarge
-              ?.copyWith(color: scheme.onSurface, fontWeight: FontWeight.w500),
+          ),
         ),
-        subtitle: subtitle == null
-            ? null
-            : Text(subtitle!, maxLines: 1, overflow: TextOverflow.ellipsis),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        onTap: onTap,
-      ),
+        const Divider(height: 1),
+        Expanded(
+          child: ListView(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+            children: [
+              _ChatNavItem(
+                icon: Icons.person_outline,
+                label: 'Profile',
+                onTap: onProfile,
+              ),
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 2),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: _BackNavButton(
+                        label: 'Characters',
+                        onTap: onCharacters,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _BackNavButton(label: 'Chats', onTap: onChats),
+                    ),
+                  ],
+                ),
+              ),
+              _ChatNavItem(
+                icon: Icons.photo_library_outlined,
+                label: 'Gallery',
+                onTap: onGallery,
+              ),
+              _ChatNavItem(
+                icon: Icons.edit_note_outlined,
+                label: 'Edit Chat',
+                onTap: onEditChat,
+              ),
+              _ChatNavItem(
+                icon: Icons.tune_outlined,
+                label: 'Preset',
+                subtitle: presetName,
+                onTap: onPreset,
+              ),
+              _ChatNavItem(
+                icon: Icons.book_outlined,
+                label: 'Memory',
+                subtitle: memorySubtitle,
+                onTap: onMemory,
+              ),
+              _ChatNavItem(
+                icon: Icons.account_tree_outlined,
+                label: 'Chat Graph',
+                subtitle: graphSubtitle,
+                onTap: onChatGraph,
+              ),
+              const SizedBox(height: 4),
+              _ChatNavItem(
+                icon: Icons.dns_outlined,
+                label: 'Provider & model',
+                subtitle: providerSubtitle,
+                onTap: onProviderModel,
+              ),
+            ],
+          ),
+        ),
+        const Divider(height: 1),
+        _ChatDrawerFooter(
+          onSettings: onSettings,
+          onImageGen: onImageGen,
+          onExport: onExport,
+          onRestart: onRestart,
+          onDelete: onDelete,
+          onNotifications: onNotifications,
+        ),
+      ],
     );
   }
 }
 
-/// One half of the "← Characters / ← Chats" back-navigation pair.
-class _BackNavButton extends StatelessWidget {
-  const _BackNavButton({required this.label, required this.onTap});
-
-  final String label;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return OutlinedButton.icon(
-      onPressed: onTap,
-      icon: const Icon(Icons.chevron_left, size: 18),
-      label: Text(label, overflow: TextOverflow.ellipsis),
-      style: OutlinedButton.styleFrom(
-        padding: const EdgeInsets.symmetric(horizontal: 8),
-        shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      ),
-    );
-  }
-}
-
-/// The utility strip pinned to the bottom of the chat sidebar: icon-only chat
-/// actions, echoing agnai's footer row.
 class _ChatDrawerFooter extends StatelessWidget {
   const _ChatDrawerFooter({
     required this.onSettings,
@@ -3290,9 +4551,9 @@ class _EmptyState extends StatelessWidget {
                   ? 'Say something to get started.'
                   : 'Add a provider with a model to start chatting.',
               textAlign: TextAlign.center,
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    color: scheme.onSurfaceVariant,
-                  ),
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
             ),
             if (!configured) ...[
               const SizedBox(height: 16),
@@ -3308,7 +4569,6 @@ class _EmptyState extends StatelessWidget {
     );
   }
 }
-// APPEND-MARKER-4
 
 /// The chat-screen quick picker: switch the active provider and choose its
 /// model without leaving the conversation. "Manage providers" drops into the
@@ -3328,7 +4588,8 @@ class _QuickSettingsSheetState extends State<_QuickSettingsSheet> {
       context: context,
       title: 'Choose model',
       entries: [
-        for (final m in state.cachedModels(active.id)) PickerEntry(id: m, title: m),
+        for (final m in state.cachedModels(active.id))
+          PickerEntry(id: m, title: m),
       ],
       selectedId: active.model.trim(),
       allowCustom: true,
@@ -3552,8 +4813,11 @@ class _ImpersonateButton extends StatelessWidget {
           clipBehavior: Clip.antiAlias,
           child: impersonating
               ? CharacterAvatar(character: persona!, size: diameter)
-              : Icon(Icons.person_outline,
-                  color: scheme.onSurfaceVariant, size: 22),
+              : Icon(
+                  Icons.person_outline,
+                  color: scheme.onSurfaceVariant,
+                  size: 22,
+                ),
         ),
       ),
     );
@@ -3594,16 +4858,19 @@ class _ImpersonatePickerState extends State<_ImpersonatePicker> {
     final q = _query.trim().toLowerCase();
     if (q.isEmpty) return widget.characters;
     return widget.characters
-        .where((c) =>
-            c.name.toLowerCase().contains(q) ||
-            c.blurb.toLowerCase().contains(q))
+        .where(
+          (c) =>
+              c.name.toLowerCase().contains(q) ||
+              c.blurb.toLowerCase().contains(q),
+        )
         .toList();
   }
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final bottom = MediaQuery.viewInsetsOf(context).bottom +
+    final bottom =
+        MediaQuery.viewInsetsOf(context).bottom +
         MediaQuery.paddingOf(context).bottom;
     final results = _visible;
 
@@ -3618,8 +4885,10 @@ class _ImpersonatePickerState extends State<_ImpersonatePicker> {
               padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
               child: Row(
                 children: [
-                  Text('Impersonate',
-                      style: Theme.of(context).textTheme.titleMedium),
+                  Text(
+                    'Impersonate',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
                 ],
               ),
             ),
@@ -3645,23 +4914,28 @@ class _ImpersonatePickerState extends State<_ImpersonatePicker> {
                   ListTile(
                     leading: CircleAvatar(
                       backgroundColor: scheme.secondaryContainer,
-                      child: Icon(Icons.person_outline,
-                          color: scheme.onSecondaryContainer),
+                      child: Icon(
+                        Icons.person_outline,
+                        color: scheme.onSecondaryContainer,
+                      ),
                     ),
                     title: const Text('Yourself'),
                     subtitle: const Text('Stop impersonating'),
                     trailing: widget.currentId == null
                         ? Icon(Icons.check, color: scheme.primary)
                         : null,
-                    onTap: () => Navigator.of(context)
-                        .pop(const _ImpersonationChoice(null)),
+                    onTap: () => Navigator.of(
+                      context,
+                    ).pop(const _ImpersonationChoice(null)),
                   ),
                   if (widget.characters.isEmpty)
                     const Padding(
                       padding: EdgeInsets.all(24),
                       child: Center(
-                        child: Text('No characters yet — import or create one '
-                            'to impersonate.'),
+                        child: Text(
+                          'No characters yet — import or create one '
+                          'to impersonate.',
+                        ),
                       ),
                     )
                   else if (results.isEmpty)
@@ -3673,17 +4947,23 @@ class _ImpersonatePickerState extends State<_ImpersonatePicker> {
                     for (final c in results)
                       ListTile(
                         leading: CharacterAvatar(character: c, radius: 20),
-                        title: Text(c.displayName,
-                            maxLines: 1, overflow: TextOverflow.ellipsis),
+                        title: Text(
+                          c.displayName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
                         subtitle: c.blurb.isEmpty
                             ? null
-                            : Text(c.blurb,
-                                maxLines: 1, overflow: TextOverflow.ellipsis),
+                            : Text(
+                                c.blurb,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
                         trailing: widget.currentId == c.id
                             ? Icon(Icons.check, color: scheme.primary)
                             : null,
-                        onTap: () => Navigator.of(context)
-                            .pop(_ImpersonationChoice(c)),
+                        onTap: () =>
+                            Navigator.of(context).pop(_ImpersonationChoice(c)),
                       ),
                 ],
               ),
@@ -3694,5 +4974,3 @@ class _ImpersonatePickerState extends State<_ImpersonatePicker> {
     );
   }
 }
-
-

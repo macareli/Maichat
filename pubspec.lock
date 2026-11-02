@@ -265,7 +265,7 @@ packages:
     source: hosted
     version: "2.0.2"
   html:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: html
       sha256: "6d1264f2dffa1b1101c25a91dff0dc2daee4c18e87cd8538729773c073dbf602"
@@ -749,6 +749,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.2.1"
+  timezone:
+    dependency: "direct main"
+    description:
+      name: timezone
+      sha256: "9f4e5a1a0e4fef7dd3424842c0575db01bfb7a11730e8d55753fcd5c5c98767b"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.11.2"
   typed_data:
     dependency: transitive
     description:
@@ -926,7 +934,7 @@ packages:
     source: hosted
     version: "7.0.1"
   yaml:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: yaml
       sha256: b9da305ac7c39faa3f030eccd175340f968459dae4af175130b3fc47e40d76ce

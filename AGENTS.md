@@ -53,8 +53,9 @@ commits or pull request descriptions.
 
 ## Build artifacts and version consistency
 
-- CI (`.github/workflows/build-apk.yml`) analyzes and tests pushes and pull
-  requests to `main`; pushes, version tags, and manual dispatch can build APKs.
+- CI (`.github/workflows/build-apk.yml`) analyzes and tests pushes to `main`
+  and `beta`, and pull requests to `main`; pushes, version tags, and manual
+  dispatch can build APKs.
   A `v*` tag requires all four signing secrets: `KEYSTORE_BASE64`,
   `KEYSTORE_PASSWORD`, `KEY_PASSWORD`, and `KEY_ALIAS`. Missing signing on a
   version tag, or incomplete supplied signing configuration, fails the build.
@@ -66,6 +67,11 @@ commits or pull request descriptions.
   drift — keep it that way.
 - In-place Android upgrades require a matching application ID and signing key.
   Builds signed with different keys cannot replace one another in place.
+- Beta builds use `--dart-define=MAICHAT_BETA=true` for both Dart behavior and
+  the Android package `io.github.macareli.maichat.beta`; the namespace remains
+  `io.github.macareli.maichat`. The beta updater compares CI build numbers
+  from the rolling `beta-latest` prerelease. Main builds use normal releases;
+  both update channels stay within `macareli/Maichat`.
 
 ## Change and verification practices
 
@@ -94,6 +100,10 @@ times out ten minutes later, with no assertion failure. Wrap those calls in
 unaffected. Two related traps in the same tests: a progress spinner means
 `pumpAndSettle` never settles, and a drag started at the left edge of the chat is
 eaten by the drawer's edge-swipe region.
+
+Real HTTP client tests must use files of plain `test()` cases. A `testWidgets`
+case installs HTTP overrides for that file and can turn loopback requests into
+400 responses even in neighboring plain tests.
 
 **Never
 `await state.send(...)` inside a `testWidgets` body before pumping** — a reply's
@@ -139,6 +149,13 @@ bar or the overflow menu.
   `Conversation.copyAs` keeps fork/renumber from dropping a new per-chat field.
 - **`AppState.init()` must always finish** (timeout + catch, surfaces `loadError`,
   goes read-only on failure). A throw here = permanent startup spinner.
+- **Keep heavy startup work after Home's first frame.** Real launch enables
+  `backgroundWarmUp`; tokenizer initialization runs through
+  `AppTokenizer.warmUp` in a root-zone isolate, while picture sweeping and due
+  backups wait for `_deferredStartupWork`. Counts use the approximate heuristic
+  while warming. Tests leave the flag off because widget fake-async does not
+  deliver isolate replies. `TokenizerKind.none` skips warmup and releases BPE
+  vocabularies. `_ThemeCache` reuses themes while appearance is unchanged.
 - **The thread is a `reverse: true` list, and that has consequences.** Its newest
   turn is anchored to the bottom and every older message is positioned relative to
   it, so a turn that grows moves the whole conversation above it. Two rules follow:
@@ -415,6 +432,82 @@ bar or the overflow menu.
   `AppState.generateImages`; "Send to chat" goes through `postImageToChat`. Reached
   from the drawer footer, the composer's operations strip, and
   `MessageAction.imagine`.
+- **Chat tools:** `models/chat_tool.dart` defines portable configurations,
+  variant-owned run records and pure tracker projection; `services/chat_tools/`
+  owns schemas, bounded Recipe JSON execution and dice. `state/chat_tools_state.dart`
+  coordinates normal chat generation through `AgentClient`, retaining the
+  selected provider, model, preset, budget and stream cadence. Tool calling
+  starts disabled; per-chat configurations are full overrides. Execute only
+  complete calls from a successfully completed response: EOF, truncation and
+  cancellation cannot run partial operations. Preserve opaque dialect metadata,
+  complete call/result exchanges during trimming, and local-effect preconditions.
+  Swipes, forks, deletes and restarts project saved results rather than running
+  handlers again. Generated pictures belong to the producing variant, including
+  inactive alternatives in retention. Redacted actual requests feed View prompt;
+  reopening reconstructs requests from records without executing tools. See
+  `developer notes/chat-tool-calling-plan.md` and actual-wire integration tests.
+- **Saved side conversations (`/btw`):** `models/btw_conversation.dart`,
+  `state/btw_state.dart`, and `widgets/btw_thread_controller.dart` persist threads
+  in `btwThreads`, separately from roleplay messages, summaries and story context.
+  Each main chat loads its own threads; restored partial replies are stopped.
+  Provider/model, system prompt and tools can be overridden per thread. Budget
+  the final side prompt with completed successful exchanges, preserving the
+  single-leading-system rule and protected in-chat instructions. Side requests
+  have independent cancellation and usage accounting; deleting a thread or chat
+  cancels both answer and title requests. Serialize thread, preference and usage
+  writes. Restore fences old callbacks, cancels jobs and drains pending writes
+  before loading the archive; an idle queue must not block `flushPendingSaves`.
+  Preserve these rules when a controller is disposed mid-restore. Thread exports
+  are scoped to one thread. The shared Chat/Playground panes use retained
+  transforms during drag, exclude covered surfaces from focus/semantics/taps,
+  and keep 48 dp controls available with short keyboards or large text. See
+  `developer notes/chat-ui-panes.md` for motion and settings contracts.
+- **Character Studio:** `models/studio.dart` owns a draft `StudioWorkspace`,
+  transcript, sub-agents, plan and spend. `StudioSession.edit` snapshots changes
+  synchronously; hand edits and rewinds advance revisions checked by
+  `models/studio_revisions.dart`, so stale writes fail rather than overwrite
+  newer work. `services/studio/studio_store.dart` writes one JSON file per
+  session, outside preferences; `StudioStore.pictureRefs` keeps session images
+  during sweeping. Session files are not automatically part of snapshot backups.
+  `studio_controller.dart` and `agent_runner.dart` own isolated runs; compaction
+  preserves complete tool exchanges, every call receives a result even on Stop,
+  and the final step declares tools with calls disabled. Interrupted sessions
+  repair orphaned calls before Resume; process-death recovery is not a native
+  background service. Sub-agents have bounded parallelism and no recursive
+  delegation. `AgentClient` supports all four dialects, complete arguments,
+  reused call indexes and required opaque provider metadata.
+  The Playground embeds the real `ChatScreen` through `ChatScreenHost` and
+  `state/chat_host.dart`, with session-owned chats outside
+  `AppState.conversations`. Saves and forks stay with the host, including replies
+  arriving after detachment. Resolved draft copies follow `draftVersion`; chat
+  edits cannot silently mutate library cards. Presets are independent workspace
+  copies, snapshotted and revisioned; apply upserts them without changing the app
+  default. Studio prompt sizing and playtests use real chat assembly, and its
+  context inspector must match actual outgoing requests. AppState's Studio client
+  and usage path never take ownership of ordinary chat's `_streaming` flag.
+- **Home launcher:** `models/home_layout.dart` owns grid geometry and repairs
+  imported layouts. `screens/home_screen.dart` edits a draft and writes
+  `homeLayout` on Done; notes live separately in `homeNotes`. Widget specs in
+  `screens/home/home_spec.dart` and `home_widgets.dart` resolve content against
+  available tile dimensions and text scale; `HomeShrink` bounds width and cannot
+  contain a vertical `Expanded`. Retain pages and tile children during swipes,
+  isolate painting, and select value-comparable state through `homeWatch`.
+  Only visible pages tick. Timers and controller listeners must also honor
+  `TickerMode`; disabling animation tickers alone does not stop them. Cost
+  selectors use ledger identity and revision instead of aggregating history
+  on each notification. A hold opens the anchored menu and moving carries the
+  tile in an overlay; tapping in edit mode selects and exposes resize handles.
+  Resize grips claim pointer-down, retain recognizers throughout previews and
+  hold page scrolling until that pointer releases or cancels. Keep a draggable
+  center on dense grids, preserve pointer ownership, and clear transient state
+  on exit. Gesture frames update the overlay without rebuilding Home/pages.
+  Selection outlines follow the tile's own shape. Record-valued animation
+  cleanup uses equality or generations, not `identical`. See
+  `developer notes/home-v2-plan.md` and Home interaction/activity/size tests.
+- **Expressive theme:** `Appearance.expressive` and `palette` select the
+  Material 3 Expressive shapes, typography, controls and transitions through
+  `MaiChatApp._expressive`. Do not give button themes a resolved
+  `textStyle` with `inherit: false`; interpolation against defaults can throw.
 - **Branches / Chat Graph:** a branch is a whole `Conversation` linked to its
   source by `Conversation.parentId` + `forkIndex` (set only by
   `AppState.forkConversation`). `services/chat_graph.dart` is the pure view over
@@ -427,8 +520,9 @@ bar or the overflow menu.
 
 - **Touch and rendering performance:** validate the gallery pinch ladder,
   floating-picture drag/resize/rotation, and chat scrolling during streaming on
-  a physical device. Widget tests establish offsets and extents, not perceived
-  smoothness.
+  a physical device. Include Home carry/resize/page gestures and the chat/side
+  pane keyboard transitions. Widget tests establish offsets and extents, not
+  perceived smoothness.
 - **Image endpoints:** loopback tests cover supported protocol shapes. Test a
   configured endpoint to establish its accepted quality/size values and whether
   it returns image URLs or base64 data.

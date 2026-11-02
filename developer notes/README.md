@@ -18,3 +18,12 @@ references against current code and keep these contracts and constraints current
   invariants and Flutter testing constraints.
 - [screenshots.md](screenshots.md) — reproducible README images and their
   rendering constraints.
+
+- [home-v2-plan.md](home-v2-plan.md) — Home launcher widgets, layout, and
+  persistence behavior.
+- [chat-tool-calling-research.md](chat-tool-calling-research.md) — tool-calling
+  protocols and reuse research.
+- [chat-tool-calling-plan.md](chat-tool-calling-plan.md) — tool configuration,
+  integration behavior, and validation.
+- [chat-ui-panes.md](chat-ui-panes.md) — chat panes, saved side threads,
+  per-thread settings, request budgeting, and exports.
