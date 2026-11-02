@@ -1,0 +1,1130 @@
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart' hide Provider;
+
+import '../../models/character.dart';
+import '../../models/folder.dart';
+import '../../models/gallery_image.dart';
+import '../../models/view_prefs.dart';
+import '../../services/gallery_group.dart';
+import '../../state/app_state.dart';
+import '../../widgets/adaptive_mosaic.dart';
+import '../../widgets/app_drawer.dart';
+import '../../widgets/avatar_image.dart';
+import '../../widgets/natural_image.dart';
+import '../../widgets/photo_surface.dart';
+import '../../widgets/smooth_image.dart';
+import '../../widgets/tag_filter_sheet.dart';
+import 'gallery_actions.dart';
+import 'gallery_upload_sheet.dart';
+import 'gallery_zoom.dart';
+import 'image_viewer_screen.dart';
+
+/// Which gallery this is, which decides its title, what it holds and what a
+/// picture can do once it is open.
+enum GalleryMode {
+  /// Everything, from the app drawer — including pictures that belong to nobody.
+  /// The only mode that can filter by character.
+  everything,
+
+  /// One character's album, from their actions menu.
+  character,
+
+  /// One character's album, reached from inside a chat: a picture here can be
+  /// thrown onto the conversation.
+  chat,
+}
+
+/// A gallery: pictures grouped by date, pinch to change how many you see at once.
+///
+/// The three modes share one screen deliberately — the difference between "all my
+/// pictures", "Sumire's pictures" and "Sumire's pictures, while talking to her" is
+/// which records are listed and one extra action, not three screens that drift
+/// apart.
+class GalleryScreen extends StatefulWidget {
+  const GalleryScreen({
+    super.key,
+    this.mode = GalleryMode.everything,
+    this.characterId,
+    this.conversationId,
+  });
+
+  final GalleryMode mode;
+
+  /// Whose album, for [GalleryMode.character] and [GalleryMode.chat].
+  final String? characterId;
+
+  /// The thread a picture would be thrown onto, for [GalleryMode.chat].
+  final String? conversationId;
+
+  @override
+  State<GalleryScreen> createState() => _GalleryScreenState();
+}
+
+class _GalleryScreenState extends State<GalleryScreen> {
+  final TextEditingController _search = TextEditingController();
+  String _query = '';
+  GallerySort _sort = GallerySort.newest;
+  final Set<String> _tagFilter = <String>{};
+
+  /// Whether only starred pictures are shown.
+  bool _starredOnly = false;
+
+  /// The character filter, in the whole-app gallery only.
+  String? _ownerFilter;
+  bool _filterUnowned = false;
+
+  /// A "Folder Gallery" filter, in the whole-app gallery only: when set, the
+  /// gallery shows the union of the folder's own pictures and every picture
+  /// belonging to one of its characters. Wins over [_ownerFilter] /
+  /// [_filterUnowned] while it is set.
+  String? _folderFilter;
+
+  GalleryZoom _zoom = kDefaultGalleryZoom;
+
+  bool _selecting = false;
+  final Set<String> _selection = <String>{};
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.mode != GalleryMode.everything) {
+      _ownerFilter = widget.characterId;
+    }
+  }
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
+  bool get _isAlbum => widget.mode != GalleryMode.everything;
+
+  // --- what is shown -------------------------------------------------------
+
+  /// The pool this gallery draws from before any filtering.
+  List<GalleryImage> _pool(AppState state) => _isAlbum
+      ? state.gallery
+            .where((image) => image.characterId == widget.characterId)
+            .toList()
+      : state.gallery;
+
+  List<String> _tagsOf(List<GalleryImage> images) {
+    final tags = <String>{};
+    for (final image in images) {
+      tags.addAll(image.tags);
+    }
+    return tags.toList()..sort();
+  }
+
+  /// Applies the search text, the tag filter, the starred filter and (in the
+  /// whole-app gallery) the character filter, then the chosen order.
+  List<GalleryImage> _visible(AppState state, List<GalleryImage> pool) {
+    final q = _query.trim().toLowerCase();
+    final filtered = pool.where((image) {
+      if (_starredOnly && !image.starred) return false;
+      if (!_isAlbum) {
+        final folder = _folderFilter == null
+            ? null
+            : state.folderById(_folderFilter);
+        if (folder != null) {
+          // The folder's own pictures, plus everything owned by one of its
+          // characters.
+          final owned = image.characterId != null &&
+              folder.characterIds.contains(image.characterId);
+          if (!owned && !folder.galleryImageIds.contains(image.id)) {
+            return false;
+          }
+        } else {
+          if (_filterUnowned && image.characterId != null) return false;
+          if (!_filterUnowned &&
+              _ownerFilter != null &&
+              image.characterId != _ownerFilter) {
+            return false;
+          }
+        }
+      }
+      // Every chosen tag must be present — the same AND semantics the character
+      // roster's filter has, so the control behaves the way it looks.
+      if (_tagFilter.isNotEmpty &&
+          !_tagFilter.every((t) => image.tags.contains(t))) {
+        return false;
+      }
+      if (q.isEmpty) return true;
+      if (image.displayTitle.toLowerCase().contains(q)) return true;
+      if (image.tags.any((t) => t.toLowerCase().contains(q))) return true;
+      final owner = state.characterById(image.characterId);
+      return owner != null && owner.displayName.toLowerCase().contains(q);
+    }).toList();
+
+    return sortImages(
+      filtered,
+      _sort,
+      nameOf: (id) => state.characterById(id)?.displayName ?? '',
+    );
+  }
+
+  // --- actions -------------------------------------------------------------
+
+  Future<void> _upload() async {
+    await showGalleryUploadSheet(
+      context,
+      characterId: _isAlbum ? widget.characterId : _ownerFilter,
+      allowChoosingOwner: !_isAlbum,
+    );
+  }
+
+  /// Opens the run at [index], full screen.
+  ///
+  /// The route goes first and the bookkeeping follows. `touchGalleryImage`
+  /// re-encodes the whole gallery and writes it to `SharedPreferences`, and it used
+  /// to be **awaited before the push** — so every tap paid a JSON encode of every
+  /// picture before anything moved. That is the stutter between the tap and the
+  /// photo. Nothing on screen depends on the write, so it happens after.
+  Future<void> _open(
+    List<GalleryImage> images,
+    int index,
+    double openedAt,
+  ) async {
+    final state = context.read<AppState>();
+    final id = images[index].id;
+    final opened = openImageViewer(
+      context,
+      images: images,
+      index: index,
+      // Sending depends on there being a chat to send to, not on which mode this
+      // is: "All pictures" reached from a conversation must still be able to throw
+      // one onto it, or that route is a dead end the user walked into.
+      extra: widget.conversationId == null
+          ? ViewerExtra.none
+          : ViewerExtra.sendToChat,
+      conversationId: widget.conversationId,
+      // So the viewer can draw the bitmap this tile has already decoded rather
+      // than showing black while a bigger one decodes.
+      openedAt: openedAt,
+    );
+    await state.touchGalleryImage(id);
+    await opened;
+  }
+
+  void _toggleSelect(String id) => setState(() {
+    if (!_selection.remove(id)) _selection.add(id);
+  });
+
+  void _exitSelection() => setState(() {
+    _selecting = false;
+    _selection.clear();
+  });
+
+  Future<void> _deleteSelected(AppState state) async {
+    if (_selection.isEmpty) return;
+    final count = _selection.length;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Delete $count picture${count == 1 ? '' : 's'}?'),
+        content: const Text(
+          'They are removed from the gallery, and from any character wearing '
+          'them.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    await state.deleteGalleryImages(_selection.toList());
+    if (!mounted) return;
+    _exitSelection();
+  }
+
+  Future<void> _exportSelected(AppState state) async {
+    final chosen = state.gallery
+        .where((i) => _selection.contains(i.id))
+        .toList();
+    if (chosen.isEmpty) return;
+    await exportGalleryImages(context, chosen);
+  }
+
+  Future<void> _pickSort() async {
+    final picked = await showModalBottomSheet<GallerySort>(
+      context: context,
+      showDragHandle: true,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final option in GallerySort.values)
+              // "Character" only means something where several characters'
+              // pictures are mixed together.
+              if (!_isAlbum || option != GallerySort.character)
+                ListTile(
+                  title: Text(option.label),
+                  trailing: _sort == option ? const Icon(Icons.check) : null,
+                  onTap: () => Navigator.of(context).pop(option),
+                ),
+          ],
+        ),
+      ),
+    );
+    if (picked != null) setState(() => _sort = picked);
+  }
+
+  void _showTagFilter(List<String> tags) {
+    if (tags.isEmpty) {
+      _say('No tags on any picture here yet.');
+      return;
+    }
+    showTagFilterSheet(
+      context,
+      tags: tags,
+      selected: _tagFilter,
+      onChanged: () => setState(() {}),
+    );
+  }
+
+  Future<void> _pickOwner(AppState state) async {
+    final picked = await showModalBottomSheet<_OwnerChoice>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (context) => _OwnerFilterSheet(
+        characters: state.characters,
+        countOf: state.galleryCountFor,
+        folders: state.folders,
+        folderCountOf: (folder) => _folderImageCount(state, folder),
+        selected: _folderFilter != null
+            ? _OwnerChoice.folder(_folderFilter)
+            : _filterUnowned
+                ? const _OwnerChoice.unowned()
+                : _OwnerChoice(_ownerFilter),
+      ),
+    );
+    if (picked == null) return;
+    setState(() {
+      _folderFilter = picked.folderId;
+      _filterUnowned = picked.unowned;
+      _ownerFilter = picked.unowned ? null : picked.characterId;
+    });
+  }
+
+  /// Pictures a "Folder Gallery" filter would show: the folder's own pictures
+  /// plus everything owned by one of its characters.
+  int _folderImageCount(AppState state, Folder folder) {
+    final owners = folder.characterIds.toSet();
+    final ids = folder.galleryImageIds.toSet();
+    return state.gallery
+        .where((image) =>
+            (image.characterId != null && owners.contains(image.characterId)) ||
+            ids.contains(image.id))
+        .length;
+  }
+
+  void _say(String message) => ScaffoldMessenger.of(context).showSnackBar(
+    SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
+  );
+
+  // --- build ---------------------------------------------------------------
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    if (!state.ready) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    final owner = state.characterById(widget.characterId);
+    final pool = _pool(state);
+    final tags = _tagsOf(pool);
+    final visible = _visible(state, pool);
+    final freeSize = state.freeSizeCards(BrowseSection.gallery);
+    final sections = groupImages(
+      visible,
+      grouping: _zoom.grouping,
+      chronological: _sort.isChronological,
+    );
+    final bottom = MediaQuery.paddingOf(context).bottom;
+
+    return Scaffold(
+      // The drawer belongs to the whole-app gallery; an album is a place you came
+      // to from somewhere, so it keeps its back arrow.
+      drawer: (_selecting || _isAlbum)
+          ? null
+          : const AppDrawer(selected: DrawerSection.gallery),
+      floatingActionButton: _selecting
+          ? null
+          : FloatingActionButton.extended(
+              onPressed: _upload,
+              icon: const Icon(Icons.add_photo_alternate_outlined),
+              label: const Text('Add'),
+            ),
+      body: GalleryZoomDetector(
+        zoom: _zoom,
+        onChanged: (zoom) => setState(() => _zoom = zoom),
+        child: CustomScrollView(
+          slivers: [
+            if (_selecting)
+              SliverAppBar(
+                pinned: true,
+                leading: IconButton(
+                  icon: const Icon(Icons.close),
+                  onPressed: _exitSelection,
+                ),
+                title: Text('${_selection.length} selected'),
+                actions: [
+                  IconButton(
+                    tooltip: 'Export selected',
+                    icon: const Icon(Icons.download_outlined),
+                    onPressed: _selection.isEmpty
+                        ? null
+                        : () => _exportSelected(state),
+                  ),
+                  IconButton(
+                    tooltip: 'Delete selected',
+                    icon: const Icon(Icons.delete_outline),
+                    onPressed: _selection.isEmpty
+                        ? null
+                        : () => _deleteSelected(state),
+                  ),
+                ],
+              )
+            else
+              // The large title, like the Library's: a gallery is a place to
+              // browse, so it opens unhurried rather than under a dense band.
+              SliverAppBar.large(
+                title: Text(_titleFor(owner)),
+                actions: [
+                  // The pinch is the real control for this; the menu is how it is
+                  // discovered, and it names what each rung groups by so the
+                  // ladder is not a secret.
+                  PopupMenuButton<GalleryZoom>(
+                    tooltip: 'Size',
+                    icon: const Icon(Icons.grid_view_outlined),
+                    initialValue: _zoom,
+                    onSelected: (zoom) => setState(() => _zoom = zoom),
+                    itemBuilder: (context) => [
+                      for (final rung in GalleryZoom.values)
+                        PopupMenuItem<GalleryZoom>(
+                          value: rung,
+                          child: Text(_zoomLabel(rung, freeSize: freeSize)),
+                        ),
+                    ],
+                  ),
+                  IconButton(
+                    tooltip: 'Add pictures',
+                    icon: const Icon(Icons.add_photo_alternate_outlined),
+                    onPressed: _upload,
+                  ),
+                  IconButton(
+                    tooltip: 'Select multiple',
+                    icon: const Icon(Icons.checklist_outlined),
+                    onPressed: pool.isEmpty
+                        ? null
+                        : () => setState(() => _selecting = true),
+                  ),
+                ],
+              ),
+            SliverToBoxAdapter(child: _searchAndControls(state, tags)),
+            if (pool.isEmpty)
+              SliverFillRemaining(
+                hasScrollBody: false,
+                child: _EmptyGallery(
+                  owner: owner,
+                  everything: !_isAlbum,
+                  onAdd: _upload,
+                ),
+              )
+            else if (visible.isEmpty)
+              const SliverFillRemaining(
+                hasScrollBody: false,
+                child: _NoMatches(),
+              )
+            else ...[
+              for (final section in sections) ...[
+                if (section.hasLabel) _sectionHeader(section.label),
+                _grid(state, section.images, visible),
+              ],
+              SliverToBoxAdapter(child: SizedBox(height: 96 + bottom)),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _titleFor(Character? owner) {
+    if (!_isAlbum) return 'Gallery';
+    if (owner == null) return 'Gallery';
+    return 'Gallery of ${owner.displayName}';
+  }
+
+  Widget _searchAndControls(AppState state, List<String> tags) => Padding(
+    padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+    child: Column(
+      children: [
+        SearchBar(
+          controller: _search,
+          hintText: _isAlbum ? 'Search photos' : 'Search the gallery',
+          padding: const WidgetStatePropertyAll(
+            EdgeInsets.symmetric(horizontal: 14),
+          ),
+          leading: const Icon(Icons.search),
+          trailing: [
+            if (_query.isNotEmpty)
+              IconButton(
+                tooltip: 'Clear',
+                icon: const Icon(Icons.close),
+                onPressed: () {
+                  _search.clear();
+                  setState(() => _query = '');
+                },
+              ),
+          ],
+          onChanged: (v) => setState(() => _query = v),
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            _ControlChip(
+              icon: Icons.sort,
+              label: _sort.shortLabel,
+              onTap: _pickSort,
+            ),
+            const SizedBox(width: 8),
+            // Starring is only useful if the stars can be pulled up on their
+            // own, so the filter sits beside the others rather than in a menu.
+            // Icon-only: with four controls, a fourth word does not fit on a
+            // phone, and a star needs no caption.
+            _ControlChip(
+              key: const Key('gallery-starred-chip'),
+              icon: _starredOnly ? Icons.star : Icons.star_border,
+              tooltip: _starredOnly ? 'Showing starred' : 'Starred only',
+              selected: _starredOnly,
+              onTap: () => setState(() => _starredOnly = !_starredOnly),
+            ),
+            const SizedBox(width: 8),
+            _ControlChip(
+              icon: Icons.label_outline,
+              label: _tagFilter.isEmpty ? 'Tags' : '${_tagFilter.length}',
+              selected: _tagFilter.isNotEmpty,
+              onTap: () => _showTagFilter(tags),
+            ),
+            if (!_isAlbum) ...[
+              const SizedBox(width: 8),
+              // Flexible, not fixed: a long character name shortens rather
+              // than pushing the row off the edge of a phone screen.
+              Flexible(
+                child: _ControlChip(
+                  icon: Icons.person_outline,
+                  label: _ownerLabel(state),
+                  selected: _filterUnowned ||
+                      _ownerFilter != null ||
+                      _folderFilter != null,
+                  onTap: () => _pickOwner(state),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ],
+    ),
+  );
+
+  String _ownerLabel(AppState state) {
+    if (_folderFilter != null) {
+      return state.folderById(_folderFilter)?.displayName ?? 'Folder';
+    }
+    if (_filterUnowned) return 'Unassigned';
+    final owner = state.characterById(_ownerFilter);
+    return owner?.displayName ?? 'Everyone';
+  }
+
+  /// How a rung of the ladder reads in the size menu: what you see, and what the
+  /// date bands cover there.
+  String _zoomLabel(GalleryZoom zoom, {required bool freeSize}) {
+    final grouping = switch (zoom.grouping) {
+      DateGrouping.day => 'by day',
+      DateGrouping.week => 'by week',
+      DateGrouping.month => 'by month',
+    };
+    if (zoom.columns == 1) return 'One at a time, $grouping';
+    final prefix = freeSize ? 'Up to ' : '';
+    return '$prefix${zoom.columns} across, $grouping';
+  }
+
+  Widget _sectionHeader(String label) => SliverToBoxAdapter(
+    child: Padding(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+      child: Text(
+        label,
+        style: Theme.of(context).textTheme.titleSmall?.copyWith(
+          fontWeight: FontWeight.w700,
+          color: Theme.of(context).colorScheme.onSurfaceVariant,
+        ),
+      ),
+    ),
+  );
+
+  /// One date band's pictures. [all] is the whole visible list so the viewer can
+  /// page across band boundaries rather than being trapped in one day.
+  Widget _grid(
+    AppState state,
+    List<GalleryImage> images,
+    List<GalleryImage> all,
+  ) {
+    // At one across a picture gets room to breathe; packed four or six up, the
+    // tiles are square so the grid reads as a wall of photographs.
+    final aspect = _zoom.columns == 1 ? 1.2 : 1.0;
+    return SliverPadding(
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      sliver: state.freeSizeCards(BrowseSection.gallery)
+          ? AdaptiveMosaicSliver<GalleryImage>(
+              items: images,
+              itemKey: (image) => image.id,
+              imageKey: (image) => image.image,
+              ratioOf: (image) => avatarRatio(image.image),
+              columns: _zoom.columns,
+              mainAxisSpacing: 6,
+              crossAxisSpacing: 6,
+              itemBuilder: (context, image, width, onRatioResolved) {
+                final owner = state.characterById(image.characterId);
+                return _ImageTile(
+                  key: ValueKey<String>(image.id),
+                  image: image,
+                  columns: _zoom.columns,
+                  displayWidth: width,
+                  adaptive: true,
+                  onRatioResolved: onRatioResolved,
+                  ownerName: _isAlbum ? null : owner?.displayName,
+                  isAvatar:
+                      owner != null && state.isAvatarOf(owner, image.image),
+                  selecting: _selecting,
+                  selected: _selection.contains(image.id),
+                  onTap: () => _selecting
+                      ? _toggleSelect(image.id)
+                      : _open(all, all.indexOf(image), width),
+                  onLongPress: () => setState(() {
+                    _selecting = true;
+                    _selection.add(image.id);
+                  }),
+                );
+              },
+            )
+          : SliverGrid.builder(
+              gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: _zoom.columns,
+                mainAxisSpacing: 6,
+                crossAxisSpacing: 6,
+                childAspectRatio: aspect,
+              ),
+              itemCount: images.length,
+              itemBuilder: (context, i) {
+                final image = images[i];
+                final owner = state.characterById(image.characterId);
+                return LayoutBuilder(
+                  builder: (context, constraints) => _ImageTile(
+                    image: image,
+                    columns: _zoom.columns,
+                    displayWidth: constraints.maxWidth,
+                    ownerName: _isAlbum ? null : owner?.displayName,
+                    isAvatar:
+                        owner != null && state.isAvatarOf(owner, image.image),
+                    selecting: _selecting,
+                    selected: _selection.contains(image.id),
+                    onTap: () => _selecting
+                        ? _toggleSelect(image.id)
+                        : _open(all, all.indexOf(image), constraints.maxWidth),
+                    onLongPress: () => setState(() {
+                      _selecting = true;
+                      _selection.add(image.id);
+                    }),
+                  ),
+                );
+              },
+            ),
+    );
+  }
+}
+
+/// One picture in the grid.
+///
+/// The tile knows how many columns it is in so it can ask for a bitmap the size
+/// it will actually be drawn at — the whole reason a three-hundred-photo gallery
+/// scrolls at all. Titles are only worth showing when there is room for them.
+class _ImageTile extends StatelessWidget {
+  const _ImageTile({
+    super.key,
+    required this.image,
+    required this.columns,
+    required this.displayWidth,
+    required this.ownerName,
+    required this.isAvatar,
+    required this.selecting,
+    required this.selected,
+    required this.onTap,
+    required this.onLongPress,
+    this.adaptive = false,
+    this.onRatioResolved,
+  });
+
+  final GalleryImage image;
+  final int columns;
+  final double displayWidth;
+  final String? ownerName;
+  final bool adaptive;
+  final ValueChanged<double>? onRatioResolved;
+
+  /// Whether this picture is one of its owner's avatars — marked on the tile so
+  /// the state is visible without opening it.
+  final bool isAvatar;
+
+  final bool selecting;
+  final bool selected;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final media = MediaQuery.of(context);
+    final provider = avatarImage(
+      image.image,
+      displaySize: displayWidth,
+      devicePixelRatio: media.devicePixelRatio,
+    );
+    final roomForText = displayWidth >= 120;
+
+    final picture = provider == null
+        ? Center(
+            child: Icon(
+              Icons.broken_image_outlined,
+              color: scheme.outline,
+              size: 20,
+            ),
+          )
+        : PhotoHero(
+            tag: photoHeroTag(image.id),
+            child: SmoothImage(
+              image: provider,
+              fit: BoxFit.cover,
+              errorBuilder: (_, _, _) => Center(
+                child: Icon(
+                  Icons.broken_image_outlined,
+                  color: scheme.outline,
+                  size: 20,
+                ),
+              ),
+            ),
+          );
+    final stack = Stack(
+      fit: StackFit.expand,
+      children: [
+        picture,
+        if (image.starred)
+          const Positioned(
+            top: 4,
+            left: 4,
+            child: _TileGlyph(icon: Icons.star, tint: Colors.amber),
+          ),
+        if (isAvatar && !selecting)
+          Positioned(
+            top: 4,
+            right: 4,
+            child: _TileGlyph(
+              icon: Icons.account_circle,
+              tint: Colors.lightBlueAccent.shade100,
+            ),
+          ),
+        if (selecting)
+          Positioned(
+            top: 4,
+            right: 4,
+            child: _TileGlyph(
+              icon: selected
+                  ? Icons.check_circle
+                  : Icons.radio_button_unchecked,
+              tint: selected ? scheme.primary : Colors.white,
+            ),
+          ),
+        if (roomForText && (image.title.trim().isNotEmpty || ownerName != null))
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            child: Container(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    Colors.transparent,
+                    Colors.black.withValues(alpha: 0.62),
+                  ],
+                ),
+              ),
+              padding: const EdgeInsets.fromLTRB(8, 14, 8, 6),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (image.title.trim().isNotEmpty)
+                    Text(
+                      image.title.trim(),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  if (ownerName != null)
+                    Text(
+                      ownerName!,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontSize: 10,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+      ],
+    );
+
+    return Material(
+      color: scheme.surfaceContainerHighest,
+      clipBehavior: Clip.antiAlias,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(columns >= 4 ? 8 : 14),
+        // A starred picture wears a gold edge as well as its glyph, so the shelf
+        // shows at a glance which ones were picked out — a small icon on a busy
+        // photograph is not a distinction.
+        side: selected
+            ? BorderSide(color: scheme.primary, width: 3)
+            : image.starred
+            ? const BorderSide(color: Color(0xFFFFC107), width: 2)
+            : BorderSide.none,
+      ),
+      child: InkWell(
+        onTap: onTap,
+        onLongPress: onLongPress,
+        // No ripple on a photograph. Material's splash animates for 640ms, which
+        // outlasts the flight into the viewer three times over and is drawn over
+        // the picture as it leaves — the "choppy" part of opening one. A photo that
+        // grows under the finger is its own feedback.
+        splashFactory: NoSplash.splashFactory,
+        highlightColor: Colors.transparent,
+        child: adaptive
+            ? NaturalFrame(
+                imageRef: image.image,
+                maxHeightFactor: double.infinity,
+                displayWidth: displayWidth,
+                onRatioResolved: onRatioResolved,
+                builder: (context, size, _) => stack,
+              )
+            : stack,
+      ),
+    );
+  }
+}
+
+/// A small icon over a picture, backed just enough to stay visible on white.
+class _TileGlyph extends StatelessWidget {
+  const _TileGlyph({required this.icon, required this.tint});
+
+  final IconData icon;
+  final Color tint;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.all(3),
+    decoration: BoxDecoration(
+      color: Colors.black.withValues(alpha: 0.38),
+      shape: BoxShape.circle,
+    ),
+    child: Icon(icon, size: 16, color: tint),
+  );
+}
+
+/// The pill buttons under the search bar, matching the character roster's.
+///
+/// Without a [label] it is a round icon-only chip, for a control whose glyph says
+/// everything (the star) — four captioned pills do not fit across a phone.
+class _ControlChip extends StatelessWidget {
+  const _ControlChip({
+    super.key,
+    required this.icon,
+    required this.onTap,
+    this.label,
+    this.tooltip,
+    this.selected = false,
+  });
+
+  final IconData icon;
+  final String? label;
+  final String? tooltip;
+  final VoidCallback onTap;
+  final bool selected;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final tint = selected
+        ? scheme.onSecondaryContainer
+        : scheme.onSurfaceVariant;
+    if (label == null) {
+      return Tooltip(
+        message: tooltip ?? '',
+        child: RawChip(
+          label: Icon(icon, size: 18, color: tint),
+          labelPadding: EdgeInsets.zero,
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+          backgroundColor: selected ? scheme.secondaryContainer : null,
+          side: selected ? BorderSide.none : null,
+          onPressed: onTap,
+        ),
+      );
+    }
+    return ActionChip(
+      avatar: Icon(icon, size: 18, color: tint),
+      label: Text(label!),
+      tooltip: tooltip,
+      backgroundColor: selected ? scheme.secondaryContainer : null,
+      side: selected ? BorderSide.none : null,
+      onPressed: onTap,
+    );
+  }
+}
+
+/// Which character's pictures to show, in the whole-app gallery.
+class _OwnerChoice {
+  const _OwnerChoice(this.characterId)
+      : unowned = false,
+        folderId = null;
+  const _OwnerChoice.unowned()
+      : characterId = null,
+        unowned = true,
+        folderId = null;
+  const _OwnerChoice.folder(this.folderId)
+      : characterId = null,
+        unowned = false;
+
+  final String? characterId;
+  final bool unowned;
+
+  /// When set, a "Folder Gallery" filter rather than a single character.
+  final String? folderId;
+}
+
+class _OwnerFilterSheet extends StatelessWidget {
+  const _OwnerFilterSheet({
+    required this.characters,
+    required this.countOf,
+    required this.folders,
+    required this.folderCountOf,
+    required this.selected,
+  });
+
+  final List<Character> characters;
+  final int Function(String? characterId) countOf;
+  final List<Folder> folders;
+  final int Function(Folder folder) folderCountOf;
+  final _OwnerChoice selected;
+
+  @override
+  Widget build(BuildContext context) {
+    final media = MediaQuery.of(context);
+    final unassigned = countOf(null);
+    return ConstrainedBox(
+      constraints: BoxConstraints(maxHeight: media.size.height * 0.75),
+      child: ListView(
+        shrinkWrap: true,
+        padding: EdgeInsets.only(bottom: media.padding.bottom + 8),
+        children: [
+          ListTile(
+            leading: const Icon(Icons.people_alt_outlined),
+            title: const Text('Everyone'),
+            trailing: (!selected.unowned &&
+                    selected.characterId == null &&
+                    selected.folderId == null)
+                ? const Icon(Icons.check)
+                : null,
+            onTap: () => Navigator.of(context).pop(const _OwnerChoice(null)),
+          ),
+          if (unassigned > 0)
+            ListTile(
+              leading: const Icon(Icons.help_outline),
+              title: const Text('Unassigned'),
+              subtitle: Text(
+                '$unassigned picture${unassigned == 1 ? '' : 's'} '
+                'that belong to nobody',
+              ),
+              trailing: selected.unowned ? const Icon(Icons.check) : null,
+              onTap: () =>
+                  Navigator.of(context).pop(const _OwnerChoice.unowned()),
+            ),
+          // "Folder Gallery" entries: a folder's own pictures plus its
+          // characters' pictures, gathered under the folder's name.
+          for (final folder in folders)
+            if (folderCountOf(folder) > 0)
+              ListTile(
+                leading: Icon(
+                  Icons.folder_outlined,
+                  color: folder.color == 0 ? null : Color(folder.color),
+                ),
+                title: Text(folder.displayName),
+                subtitle: Text(
+                  'Folder Gallery · ${folderCountOf(folder)} '
+                  'picture${folderCountOf(folder) == 1 ? '' : 's'}',
+                ),
+                trailing: selected.folderId == folder.id
+                    ? const Icon(Icons.check)
+                    : null,
+                onTap: () =>
+                    Navigator.of(context).pop(_OwnerChoice.folder(folder.id)),
+              ),
+          const Divider(height: 1),
+          for (final character in characters)
+            // A character with no pictures is not worth a row in a filter.
+            if (countOf(character.id) > 0)
+              ListTile(
+                leading: _SheetAvatar(character: character),
+                title: Text(character.displayName),
+                subtitle: Text(
+                  '${countOf(character.id)} picture'
+                  '${countOf(character.id) == 1 ? '' : 's'}',
+                ),
+                trailing: selected.characterId == character.id
+                    ? const Icon(Icons.check)
+                    : null,
+                onTap: () =>
+                    Navigator.of(context).pop(_OwnerChoice(character.id)),
+              ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SheetAvatar extends StatelessWidget {
+  const _SheetAvatar({required this.character});
+
+  final Character character;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final provider = avatarImage(
+      character.avatar,
+      displaySize: 40,
+      devicePixelRatio: MediaQuery.maybeDevicePixelRatioOf(context) ?? 1,
+    );
+    return CircleAvatar(
+      radius: 20,
+      backgroundColor: scheme.secondaryContainer,
+      foregroundImage: provider,
+      child: provider == null
+          ? Text(
+              character.displayName.characters.firstOrNull?.toUpperCase() ??
+                  '?',
+              style: TextStyle(color: scheme.onSecondaryContainer),
+            )
+          : null,
+    );
+  }
+}
+
+/// Nothing here yet. Says whose gallery is empty, and what to do about it.
+class _EmptyGallery extends StatelessWidget {
+  const _EmptyGallery({
+    required this.owner,
+    required this.everything,
+    required this.onAdd,
+  });
+
+  final Character? owner;
+  final bool everything;
+  final VoidCallback onAdd;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(32, 0, 32, 64),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.photo_library_outlined, size: 56, color: scheme.outline),
+            const SizedBox(height: 16),
+            Text(
+              everything
+                  ? 'No pictures yet'
+                  : '${owner?.displayName ?? 'This character'} has no photos yet',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              everything
+                  ? 'Add pictures here, or from a character\'s own gallery. '
+                        'They can become avatars, chat backgrounds, or float over '
+                        'a conversation.'
+                  : 'Add a few, and they can become avatars to swipe between or '
+                        'float over the chat.',
+              textAlign: TextAlign.center,
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
+            ),
+            const SizedBox(height: 20),
+            FilledButton.tonalIcon(
+              onPressed: onAdd,
+              icon: const Icon(Icons.add_photo_alternate_outlined),
+              label: const Text('Add pictures'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// A search or filter that matched nothing.
+class _NoMatches extends StatelessWidget {
+  const _NoMatches();
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(32, 0, 32, 64),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.search_off_outlined, size: 48, color: scheme.outline),
+            const SizedBox(height: 12),
+            Text(
+              'No pictures match.',
+              textAlign: TextAlign.center,
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

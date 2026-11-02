@@ -1,0 +1,401 @@
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+
+import '../../models/folder.dart';
+import '../../models/preset.dart';
+import '../../state/app_state.dart';
+import 'preset_editor_body.dart';
+
+/// The in-sidebar preset experience for the chat screen: a searchable list of
+/// presets (the chat's current one marked), a left button to make one current,
+/// and — on tapping a preset — a compact editor with a Save button that asks
+/// whether to save for just this chat or the whole preset.
+class ChatPresetPanel extends StatefulWidget {
+  const ChatPresetPanel({super.key, required this.onBack});
+
+  /// Return to the drawer's main menu.
+  final VoidCallback onBack;
+
+  @override
+  State<ChatPresetPanel> createState() => _ChatPresetPanelState();
+}
+
+class _ChatPresetPanelState extends State<ChatPresetPanel> {
+  String _query = '';
+  Preset? _editing; // a working copy; non-null means the editor is open
+
+  void _choose(AppState state, Preset preset) {
+    state.setConversationPreset(state.active.id, preset.id);
+    _announce(preset.displayName);
+  }
+
+  /// Picking a preset the folder curated: bind the chat to it, and when the
+  /// folder kept an override copy, pin that copy as the chat's preset so the
+  /// folder's shadow — not the bare library preset — is what the chat uses.
+  void _chooseFolder(AppState state, Folder folder, String presetId) {
+    state.setConversationPreset(state.active.id, presetId);
+    final override = folder.presetOverrides[presetId];
+    if (override != null) {
+      state.saveChatPresetOverride(state.active.id, override);
+    }
+    _announce(state.folderPreset(folder, presetId)?.displayName ?? 'preset');
+  }
+
+  void _announce(String name) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Preset changed to "$name"'),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  Future<void> _save(AppState state) async {
+    final preset = _editing;
+    if (preset == null) return;
+    final scope = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Save preset'),
+        content: const Text(
+          'Apply your changes to just this chat, or to the whole preset '
+          '(everywhere it is used)?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop('chat'),
+            child: const Text('This chat only'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop('all'),
+            child: const Text('Entire preset'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+        ],
+      ),
+    );
+    if (scope == null || !mounted) return;
+    final conversationId = state.active.id;
+    if (scope == 'chat') {
+      await state.saveChatPresetOverride(conversationId, preset);
+    } else {
+      await state.savePresetToLibrary(conversationId, preset);
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(scope == 'chat' ? 'Saved for this chat' : 'Preset updated'),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+    setState(() => _editing = null);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _editing == null ? _list(context) : _editor(context);
+  }
+
+  // PLACEHOLDER_PANEL
+  Widget _list(BuildContext context) {
+    final state = context.watch<AppState>();
+    final current = state.presetFor(state.active);
+    final folder = state.folderForChat(state.active);
+    final q = _query.trim().toLowerCase();
+    bool matches(Preset p) =>
+        q.isEmpty || p.displayName.toLowerCase().contains(q);
+
+    // The folder's curated presets (overrides applied) come first; the rest of
+    // the library follows under its own heading. Only a foldered chat with
+    // folder presets shows the split — everyone else sees the flat list.
+    final folderIds = folder == null ? const <String>[] : folder.presetIds;
+    final folderRows = <Widget>[];
+    final shownFolderIds = <String>{};
+    for (final id in folderIds) {
+      final p = state.folderPreset(folder!, id);
+      if (p == null || !matches(p)) continue;
+      shownFolderIds.add(id);
+      folderRows.add(
+        _PresetRow(
+          preset: p,
+          isCurrent: current?.id == p.id,
+          isDefault: folder.defaultPresetId == id,
+          onChoose: () => _chooseFolder(state, folder, id),
+          onEdit: () => setState(
+            () => _editing = Preset.fromJson(p.toJson()),
+          ),
+        ),
+      );
+    }
+    final appPresets = [
+      for (final p in state.presets)
+        if (matches(p) && !shownFolderIds.contains(p.id)) p,
+    ];
+
+    return Column(
+      children: [
+        _PanelHeader(title: 'Presets', onBack: widget.onBack),
+        if (state.hasPresetOverride(state.active))
+          _OverrideNotice(
+            presetName: current?.displayName ?? 'this preset',
+            contextSize: current?.maxContext,
+            onRevert: () =>
+                state.clearChatPresetOverride(state.active.id),
+          ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+          child: SearchBar(
+            hintText: 'Search presets',
+            leading: const Icon(Icons.search, size: 20),
+            onChanged: (v) => setState(() => _query = v),
+          ),
+        ),
+        Expanded(
+          child: (folderRows.isEmpty && appPresets.isEmpty)
+              ? const Center(child: Text('No presets'))
+              : ListView(
+                  padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+                  children: [
+                    if (folderRows.isNotEmpty) ...[
+                      const _SectionLabel('Folder presets'),
+                      ...folderRows,
+                      const Divider(height: 16),
+                      const _SectionLabel('App presets'),
+                    ],
+                    for (final p in appPresets)
+                      _PresetRow(
+                        preset: p,
+                        isCurrent: current?.id == p.id,
+                        onChoose: () => _choose(state, p),
+                        // Seed the editor from the EFFECTIVE preset for the
+                        // current chat (which may be a chat-specific override),
+                        // not the bare library copy — otherwise a "this chat"
+                        // save is invisible on re-open and looks like it reverted.
+                        onEdit: () => setState(
+                          () => _editing = Preset.fromJson(
+                            (current?.id == p.id ? current! : p).toJson(),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _editor(BuildContext context) {
+    final preset = _editing!;
+    return Column(
+      children: [
+        _PanelHeader(
+          title: preset.displayName,
+          onBack: () => setState(() => _editing = null),
+          trailing: FilledButton(
+            onPressed: () => _save(context.read<AppState>()),
+            child: const Text('Save'),
+          ),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: PresetEditorBody(
+            key: ValueKey(preset.id),
+            preset: preset,
+            compact: true,
+            onChanged: () => setState(() {}),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Tells the user this chat is pinned to its own copy of the preset — so edits
+/// made to the preset elsewhere do not reach it — and offers a way back.
+class _OverrideNotice extends StatelessWidget {
+  const _OverrideNotice({
+    required this.presetName,
+    required this.contextSize,
+    required this.onRevert,
+  });
+
+  final String presetName;
+  final int? contextSize;
+  final VoidCallback onRevert;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Card(
+      margin: const EdgeInsets.fromLTRB(12, 4, 12, 0),
+      color: theme.colorScheme.secondaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'This chat uses its own copy of "$presetName"'
+              '${contextSize == null ? '' : ' (context $contextSize)'}.',
+              style: theme.textTheme.bodyMedium,
+            ),
+            const SizedBox(height: 2),
+            Text(
+              'Changes you make to the preset elsewhere will not apply here.',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSecondaryContainer,
+              ),
+            ),
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton(
+                onPressed: onRevert,
+                child: const Text('Follow the preset again'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// A back-arrow + title (+ optional trailing) bar for the panel's sub-views.
+class _PanelHeader extends StatelessWidget {
+  const _PanelHeader({required this.title, required this.onBack, this.trailing});
+
+  final String title;
+  final VoidCallback onBack;
+  final Widget? trailing;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(4, 8, 12, 4),
+      child: Row(
+        children: [
+          IconButton(
+            icon: const Icon(Icons.chevron_left),
+            tooltip: 'Back',
+            onPressed: onBack,
+          ),
+          Expanded(
+            child: Text(
+              title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context)
+                  .textTheme
+                  .titleMedium
+                  ?.copyWith(fontWeight: FontWeight.w600),
+            ),
+          ),
+          ?trailing,
+        ],
+      ),
+    );
+  }
+}
+
+/// One preset row in the panel list: a left "make current" button, the name (+
+/// a "current" chip), and a tap target that opens the compact editor.
+class _PresetRow extends StatelessWidget {
+  const _PresetRow({
+    required this.preset,
+    required this.isCurrent,
+    required this.onChoose,
+    required this.onEdit,
+    this.isDefault = false,
+  });
+
+  final Preset preset;
+  final bool isCurrent;
+  final bool isDefault;
+  final VoidCallback onChoose;
+  final VoidCallback onEdit;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final tint = preset.colorBand != null
+        ? Color.alphaBlend(Color(preset.colorBand!).withValues(alpha: 0.16), scheme.surface)
+        : scheme.surfaceContainerLow;
+    return Card(
+      elevation: 0,
+      color: tint,
+      margin: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+      clipBehavior: Clip.antiAlias,
+      child: ListTile(
+        onTap: onEdit,
+        leading: IconButton(
+          tooltip: isCurrent ? 'Current preset' : 'Use this preset',
+          icon: Icon(
+            isCurrent ? Icons.radio_button_checked : Icons.radio_button_unchecked,
+            color: isCurrent ? scheme.primary : scheme.onSurfaceVariant,
+          ),
+          onPressed: onChoose,
+        ),
+        title: Row(
+          children: [
+            Flexible(
+              child: Text(
+                preset.displayName,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            if (isCurrent) ...[
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(
+                  color: scheme.secondaryContainer,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  'current',
+                  style: Theme.of(context)
+                      .textTheme
+                      .labelSmall
+                      ?.copyWith(color: scheme.onSecondaryContainer),
+                ),
+              ),
+            ],
+            if (isDefault) ...[
+              const SizedBox(width: 6),
+              Icon(Icons.star, size: 16, color: scheme.primary),
+            ],
+          ],
+        ),
+        trailing: const Icon(Icons.chevron_right),
+      ),
+    );
+  }
+}
+
+/// A small uppercase heading separating the "Folder presets" and "App presets"
+/// groups in the panel list.
+class _SectionLabel extends StatelessWidget {
+  const _SectionLabel(this.text);
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+      child: Text(
+        text.toUpperCase(),
+        style: theme.textTheme.labelSmall?.copyWith(
+          color: theme.colorScheme.primary,
+          fontWeight: FontWeight.w700,
+          letterSpacing: 0.6,
+        ),
+      ),
+    );
+  }
+}

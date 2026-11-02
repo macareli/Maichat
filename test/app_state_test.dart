@@ -1,0 +1,639 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:maichat/models/character.dart';
+import 'package:maichat/models/conversation.dart';
+import 'package:maichat/models/message.dart';
+import 'package:maichat/models/provider.dart';
+import 'package:maichat/models/summary.dart';
+import 'package:maichat/services/chat_client.dart';
+import 'package:maichat/services/tokenizer.dart';
+import 'package:maichat/state/app_state.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+/// Stands in for a live endpoint: replays [deltas], or fails on demand.
+class FakeClient extends ChatClient {
+  FakeClient({this.deltas = const <String>[], this.failure});
+
+  final List<String> deltas;
+  final String? failure;
+  List<ChatMessage>? lastHistory;
+  Provider? lastProvider;
+
+  @override
+  Stream<ChatDelta> streamChat({
+    required Provider provider,
+    required List<ChatMessage> history,
+    GenParams params = const GenParams(),
+  }) async* {
+    lastProvider = provider;
+    lastHistory = List<ChatMessage>.from(history);
+    if (failure != null) throw ChatApiException(failure!);
+    for (final delta in deltas) {
+      yield ChatDelta(text: delta);
+    }
+  }
+
+  @override
+  Future<List<String>> listModels(Provider provider) async => ['b', 'a'];
+}
+
+Provider _provider({String id = 'p', String model = 'm'}) => Provider(
+      id: id,
+      name: 'Test',
+      kind: ProviderKind.openai,
+      baseUrl: 'https://host.tld/v1',
+      apiKey: '',
+      model: model,
+    );
+
+Future<AppState> _state(FakeClient client) async {
+  SharedPreferences.setMockInitialValues(<String, Object>{});
+  final state = AppState(client: client);
+  await state.init();
+  await state.addProvider(_provider());
+  return state;
+}
+
+void main() {
+  test('streamed deltas land in one assistant turn', () async {
+    final state = await _state(FakeClient(deltas: ['Hel', 'lo ', 'there']));
+
+    await state.send('hi');
+
+    expect(state.streaming, isFalse);
+    expect(state.active.messages.length, 2);
+    expect(state.active.messages[0].content, 'hi');
+    expect(state.active.messages[1].role, 'assistant');
+    expect(state.active.messages[1].content, 'Hello there');
+    expect(state.active.messages[1].error, isFalse);
+  });
+
+  test('the request history excludes the streaming placeholder', () async {
+    final client = FakeClient(deltas: ['ok']);
+    final state = await _state(client);
+
+    await state.send('  first  ');
+
+    // The default preset assembles the request; the user's turn is last and the
+    // empty assistant placeholder is never sent.
+    final history = client.lastHistory!;
+    expect(history.last.role, 'user');
+    expect(history.last.content, 'first');
+    expect(history.every((m) => m.content.isNotEmpty), isTrue);
+    expect(client.lastProvider!.model, 'm');
+    expect(state.active.title, 'first');
+  });
+
+  test('a failure replaces the placeholder with an error turn', () async {
+    final state = await _state(FakeClient(failure: 'check your API key'));
+
+    await state.send('hi');
+
+    expect(state.streaming, isFalse);
+    expect(state.active.messages.last.error, isTrue);
+    expect(state.active.messages.last.content, 'check your API key');
+  });
+
+  test('an empty stream is reported rather than left blank', () async {
+    final state = await _state(FakeClient());
+
+    await state.send('hi');
+
+    expect(state.active.messages.last.error, isTrue);
+    expect(state.active.messages.last.content, contains('empty response'));
+  });
+
+  test('nothing is sent when no provider is configured', () async {
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final state = AppState(client: FakeClient(deltas: ['x']));
+    await state.init();
+
+    await state.send('hi');
+
+    expect(state.isConfigured, isFalse);
+    expect(state.conversations, isEmpty);
+  });
+
+  test('errored turns are not resent as context', () async {
+    final client = FakeClient(failure: 'boom');
+    final state = await _state(client);
+    await state.send('one');
+
+    final second = FakeClient(deltas: ['fine']);
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final resumed = AppState(client: second);
+    await resumed.init();
+    await resumed.addProvider(_provider(id: 'p2'));
+    resumed.active.messages.addAll(state.active.messages);
+    await resumed.send('two');
+
+    // Consecutive same-role turns are merged into one, so assert on the text.
+    expect(
+      second.lastHistory!.map((m) => m.content).join('\n'),
+      stringContainsInOrder(['one', 'two']),
+    );
+    expect(second.lastHistory!.any((m) => m.content.contains('boom')), isFalse);
+  });
+
+  test('new chat reuses an existing empty thread', () async {
+    final state = await _state(FakeClient(deltas: ['x']));
+
+    state.newConversation();
+    final firstId = state.active.id;
+    state.newConversation();
+
+    expect(state.active.id, firstId);
+    expect(state.conversations, hasLength(1));
+  });
+
+  test('sending starts a second thread and orders newest first', () async {
+    final state = await _state(FakeClient(deltas: ['x']));
+    await state.send('older');
+    state.newConversation();
+    await state.send('newer');
+
+    expect(state.conversations, hasLength(2));
+    expect(state.conversations.first.title, 'newer');
+    expect(state.conversations.last.title, 'older');
+  });
+
+  test('deleting the active thread falls back to another', () async {
+    final state = await _state(FakeClient(deltas: ['x']));
+    await state.send('older');
+    state.newConversation();
+    await state.send('newer');
+
+    await state.deleteConversation(state.active.id);
+
+    expect(state.conversations, hasLength(1));
+    expect(state.active.title, 'older');
+  });
+
+  test('conversations and providers reload from storage', () async {
+    final state = await _state(FakeClient(deltas: ['saved']));
+    await state.send('persist me');
+
+    final reopened = AppState(client: FakeClient());
+    await reopened.init();
+
+    expect(reopened.conversations, hasLength(1));
+    expect(reopened.active.messages.last.content, 'saved');
+    expect(reopened.activeProvider?.model, 'm');
+  });
+
+  test('providers can be added, selected, updated and deleted', () async {
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final state = AppState(client: FakeClient());
+    await state.init();
+
+    await state.addProvider(_provider(id: 'a', model: 'm1'));
+    await state.addProvider(
+      Provider(
+        id: 'b',
+        name: 'B',
+        kind: ProviderKind.anthropic,
+        baseUrl: 'https://b/v1',
+        apiKey: '',
+        model: 'm2',
+      ),
+    );
+
+    // The most recently added becomes active.
+    expect(state.providers, hasLength(2));
+    expect(state.activeProvider?.id, 'b');
+
+    await state.selectProvider('a');
+    expect(state.activeProvider?.id, 'a');
+
+    await state.setActiveModel('m1x');
+    expect(state.activeProvider?.model, 'm1x');
+
+    await state.updateProvider(state.activeProvider!.copyWith(name: 'A2'));
+    expect(state.activeProvider?.name, 'A2');
+    expect(state.activeProvider?.model, 'm1x');
+
+    // Deleting the active provider reassigns the active pointer.
+    await state.deleteProvider('a');
+    expect(state.providers, hasLength(1));
+    expect(state.activeProvider?.id, 'b');
+  });
+
+  test('round-robin rotates the key on each send', () async {
+    final client = FakeClient(deltas: ['x']);
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final state = AppState(client: client);
+    await state.init();
+    await state.addProvider(
+      Provider(
+        id: 'p',
+        name: 'Pool',
+        kind: ProviderKind.openai,
+        baseUrl: 'https://host.tld/v1',
+        apiKeys: const ['k1', 'k2'],
+        keyStrategy: KeyRotationStrategy.roundRobin,
+        model: 'm',
+      ),
+    );
+
+    await state.send('a');
+    expect(client.lastProvider!.apiKey, 'k1');
+    await state.send('b');
+    expect(client.lastProvider!.apiKey, 'k2');
+    await state.send('c');
+    expect(client.lastProvider!.apiKey, 'k1');
+  });
+
+  test('error-based keeps a key until a request fails', () async {
+    final client = FakeClient(failure: 'check your API key');
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final state = AppState(client: client);
+    await state.init();
+    await state.addProvider(
+      Provider(
+        id: 'p',
+        name: 'Pool',
+        kind: ProviderKind.openai,
+        baseUrl: 'https://host.tld/v1',
+        apiKeys: const ['k1', 'k2'],
+        keyStrategy: KeyRotationStrategy.errorBased,
+        model: 'm',
+      ),
+    );
+
+    // Each send fails, so the pool advances by one key each time.
+    await state.send('a');
+    expect(client.lastProvider!.apiKey, 'k1');
+    await state.send('b');
+    expect(client.lastProvider!.apiKey, 'k2');
+    await state.send('c');
+    expect(client.lastProvider!.apiKey, 'k1');
+  });
+
+  test('random rotation picks a key from the pool', () async {
+    final client = FakeClient(deltas: ['x']);
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final state = AppState(client: client);
+    await state.init();
+    await state.addProvider(
+      Provider(
+        id: 'p',
+        name: 'Pool',
+        kind: ProviderKind.openai,
+        baseUrl: 'https://host.tld/v1',
+        apiKeys: const ['k1', 'k2'],
+        keyStrategy: KeyRotationStrategy.random,
+        model: 'm',
+      ),
+    );
+
+    await state.send('a');
+    expect(['k1', 'k2'], contains(client.lastProvider!.apiKey));
+  });
+
+  test('a single-key provider is sent unchanged', () async {
+    final client = FakeClient(deltas: ['x']);
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final state = AppState(client: client);
+    await state.init();
+    await state.addProvider(
+      Provider(
+        id: 'p',
+        name: 'Solo',
+        kind: ProviderKind.openai,
+        baseUrl: 'https://host.tld/v1',
+        apiKey: 'only',
+        model: 'm',
+      ),
+    );
+
+    await state.send('a');
+    expect(client.lastProvider!.apiKey, 'only');
+  });
+
+  test('a legacy settings blob migrates to one active provider', () async {
+    SharedPreferences.setMockInitialValues(<String, Object>{
+      'flutter.settings':
+          '{"baseUrl":"https://host.tld/v1","apiKey":"sk","model":"m"}',
+    });
+    final state = AppState(client: FakeClient());
+    await state.init();
+
+    expect(state.providers, hasLength(1));
+    final migrated = state.providers.single;
+    expect(migrated.kind, ProviderKind.openai);
+    expect(migrated.baseUrl, 'https://host.tld/v1');
+    expect(migrated.apiKey, 'sk');
+    expect(migrated.model, 'm');
+    expect(state.activeProvider?.id, migrated.id);
+    expect(state.isConfigured, isTrue);
+  });
+
+  test('editMessage replaces a turn in place', () async {
+    final state = await _state(FakeClient(deltas: ['hi']));
+    await state.send('hello');
+    await state.editMessage(state.active.id, 0, '  edited  ');
+    expect(state.active.messages[0].content, 'edited');
+    // An empty edit is ignored.
+    await state.editMessage(state.active.id, 0, '   ');
+    expect(state.active.messages[0].content, 'edited');
+  });
+
+  test('deleteMessage drops a single turn', () async {
+    final state = await _state(FakeClient(deltas: ['reply']));
+    await state.send('hello');
+    expect(state.active.messages, hasLength(2));
+    await state.deleteMessage(state.active.id, 1);
+    expect(state.active.messages, hasLength(1));
+    expect(state.active.messages[0].content, 'hello');
+  });
+
+  test('forkConversation copies up to the index into a new active thread',
+      () async {
+    final state = await _state(FakeClient(deltas: ['a']));
+    await state.send('one');
+    await state.send('two');
+    final source = state.active;
+    final total = source.messages.length; // 4: one, a, two, a
+    expect(total, 4);
+
+    final forkId = await state.forkConversation(source.id, 1);
+    expect(forkId, isNotEmpty);
+    expect(state.active.id, forkId);
+    // Copied messages [0..1] only, and diverged from the source.
+    expect(state.active.messages, hasLength(2));
+    expect(state.active.title, 'one · Branch 1');
+    state.active.messages[0] =
+        state.active.messages[0].copyWith(content: 'changed');
+    expect(source.messages[0].content, 'one');
+  });
+
+  test('forkConversation records the lineage the Chat Graph draws', () async {
+    final state = await _state(FakeClient(deltas: ['a']));
+    await state.send('one');
+    await state.send('two');
+    final source = state.active;
+
+    final forkId = await state.forkConversation(source.id, 1);
+    final fork = state.conversationById(forkId)!;
+    expect(fork.parentId, source.id);
+    expect(fork.forkIndex, 1);
+    // The chat it came from stays a root.
+    expect(source.parentId, isNull);
+
+    // A fork of a fork points at the fork, not the original root.
+    final deepId = await state.forkConversation(forkId, 0);
+    final deep = state.conversationById(deepId)!;
+    expect(deep.parentId, forkId);
+    expect(deep.forkIndex, 0);
+
+    // Lineage survives a save/reload round trip.
+    final reloaded = Conversation.fromJson(fork.toJson());
+    expect(reloaded.parentId, source.id);
+    expect(reloaded.forkIndex, 1);
+  });
+
+  test('branches are named after the tree root and numbered across it',
+      () async {
+    final state = await _state(FakeClient(deltas: ['a']));
+    await state.send('one');
+    await state.send('two');
+    final source = state.active;
+    // The thread is auto-titled from its first message.
+    expect(source.title, 'one');
+
+    final first = state.conversationById(
+        await state.forkConversation(source.id, 1))!;
+    final second = state.conversationById(
+        await state.forkConversation(source.id, 3))!;
+    expect(first.title, 'one · Branch 1');
+    expect(second.title, 'one · Branch 2');
+    // A branch of a branch keeps counting within the same family, and still
+    // points at the branch it actually split from.
+    final nested = state.conversationById(
+        await state.forkConversation(first.id, 0))!;
+    expect(nested.title, 'one · Branch 3');
+    expect(nested.parentId, first.id);
+  });
+
+  test('regenerateMessage retries an assistant turn from prior history',
+      () async {
+    final client = FakeClient(deltas: ['reply']);
+    final state = await _state(client);
+    await state.send('hi');
+    expect(state.active.messages[1].content, 'reply');
+
+    // A user turn cannot be regenerated.
+    await state.regenerateMessage(state.active.id, 0);
+    expect(state.active.messages, hasLength(2));
+
+    // Regenerating the assistant turn replaces it using the prior history.
+    await state.regenerateMessage(state.active.id, 1);
+    expect(state.active.messages, hasLength(2));
+    expect(state.active.messages[1].role, 'assistant');
+    expect(state.active.messages[1].content, 'reply');
+    // The retry sent the user turn but not the old assistant reply.
+    expect(client.lastHistory!.last.content, 'hi');
+    expect(client.lastHistory!.every((m) => m.role != 'assistant'), isTrue);
+  });
+
+  test('impersonation injects the chosen persona into the request', () async {
+    final client = FakeClient(deltas: ['ok']);
+    final state = await _state(client);
+    final persona = Character.empty()
+      ..name = 'Kaelen'
+      ..description = 'A weathered ranger from the northern reaches.';
+    await state.addCharacter(persona);
+
+    await state.setImpersonation(persona);
+    expect(state.active.impersonateId, persona.id);
+    expect(state.impersonationFor(state.active)?.displayName, 'Kaelen');
+
+    await state.send('hello');
+
+    // A system turn carries the persona so the model treats the user as Kaelen.
+    final systems =
+        client.lastHistory!.where((m) => m.role == 'system').toList();
+    expect(systems, isNotEmpty);
+    final joined = systems.map((m) => m.content).join('\n');
+    expect(joined, contains('Kaelen'));
+    expect(joined, contains('northern reaches'));
+  });
+
+  test('clearing impersonation drops the persona and persists', () async {
+    final client = FakeClient(deltas: ['ok']);
+    final state = await _state(client);
+    final persona = Character.empty()..name = 'Kaelen';
+    await state.addCharacter(persona);
+    await state.setImpersonation(persona);
+    final chatId = state.active.id;
+
+    await state.setImpersonation(null);
+    expect(state.active.impersonateId, isNull);
+
+    // The cleared identity survives a reload from storage.
+    final reloaded = AppState(client: client);
+    await reloaded.init();
+    final chat =
+        reloaded.conversations.firstWhere((c) => c.id == chatId);
+    expect(chat.impersonateId, isNull);
+  });
+
+  test('tokenizer config persists, reloads, and drives counting', () async {
+    final state = await _state(FakeClient(deltas: ['x']));
+    // Default is OpenAI; a real BPE count is well below the chars/4 heuristic
+    // for short English text (proves it isn't the ÷4 fallback).
+    expect(state.tokenizerConfig.kind, TokenizerKind.openai);
+    expect(state.estimateTokens('hello world'), greaterThan(0));
+
+    await state.updateTokenizerConfig(const TokenizerConfig(
+        kind: TokenizerKind.custom, customEncoding: BpeEncoding.cl100k));
+
+    final reloaded = AppState(client: FakeClient());
+    await reloaded.init();
+    expect(reloaded.tokenizerConfig.kind, TokenizerKind.custom);
+    expect(reloaded.tokenizerConfig.customEncoding, BpeEncoding.cl100k);
+  });
+
+  test('imported chats land on top, bound, and survive a reload', () async {
+    final state = await _state(FakeClient(deltas: ['x']));
+    final persona = Character.empty()
+      ..name = 'Mai'
+      ..description = 'A calm librarian.';
+    await state.addCharacter(persona);
+
+    // Two imports, the second deliberately claiming an id already in the list,
+    // which is what re-importing the same native file twice looks like.
+    await state.send('an existing thread');
+    final taken = state.conversations.first.id;
+    await state.importConversations(
+      [
+        Conversation(
+          id: 'fresh',
+          title: 'From a file',
+          messages: [ChatMessage(role: 'assistant', content: 'Hello.')],
+          updatedAt: DateTime.now(),
+          systemPrompt: 'A quiet library.',
+        ),
+        Conversation(
+          id: taken,
+          title: 'Collides',
+          messages: [ChatMessage(role: 'user', content: 'Hi.')],
+          // Older, so the list's newest-first order is unambiguous here and
+          // after the reload below, which sorts by this field.
+          updatedAt: DateTime.now().subtract(const Duration(hours: 1)),
+        ),
+      ],
+      bind: persona,
+    );
+
+    expect(state.conversations.first.title, 'From a file');
+    expect(state.conversations[1].title, 'Collides');
+    // The colliding id was moved aside rather than shadowing the existing thread.
+    expect(state.conversations.where((c) => c.id == taken), hasLength(1));
+    expect(state.conversations.where((c) => c.title == 'Collides').single.id,
+        isNot(taken));
+    // Bound, with the file's own prompt kept underneath the persona.
+    final imported = state.conversations.first;
+    expect(imported.characterId, persona.id);
+    expect(imported.characterName, 'Mai');
+    expect(imported.systemPrompt, contains('A calm librarian.'));
+    expect(imported.systemPrompt, contains('A quiet library.'));
+
+    final reloaded = AppState(client: FakeClient());
+    await reloaded.init();
+    expect(reloaded.conversations.first.title, 'From a file');
+    expect(reloaded.conversations.first.characterId, persona.id);
+  });
+
+  test('togglePinned flips and persists the pin flag', () async {
+    final state = await _state(FakeClient(deltas: ['ok']));
+    await state.send('hi');
+    final id = state.active.id;
+
+    expect(state.active.pinned, isFalse);
+    await state.togglePinned(id);
+    expect(state.active.pinned, isTrue);
+
+    final reloaded = AppState(client: FakeClient());
+    await reloaded.init();
+    expect(reloaded.conversationById(id)?.pinned, isTrue);
+
+    await state.togglePinned(id);
+    expect(state.active.pinned, isFalse);
+  });
+
+  test('setSummarySegmentCollapsed persists a fold without touching content',
+      () async {
+    final state = await _state(FakeClient(deltas: ['ok']));
+    await state.send('hi');
+    final id = state.active.id;
+    await state.setSummary(
+      id,
+      ChatSummary(
+        enabled: true,
+        segments: [
+          SummarySegment(id: 'a', content: 'body-a'),
+          SummarySegment(id: 'b', content: 'body-b'),
+        ],
+      ),
+    );
+
+    state.setSummarySegmentCollapsed(id, 'a', true);
+    expect(state.conversationById(id)!.summary!.segments[0].collapsed, isTrue);
+    expect(state.conversationById(id)!.summary!.segments[1].collapsed, isFalse);
+    // Content is untouched, and an unknown id is a no-op.
+    expect(state.conversationById(id)!.summary!.segments[0].content, 'body-a');
+    state.setSummarySegmentCollapsed(id, 'ghost', true);
+
+    // The fold survives a reload (persisted in its own small store entry).
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+    final reloaded = AppState(client: FakeClient());
+    await reloaded.init();
+    expect(reloaded.conversationById(id)!.summary!.segments[0].collapsed, isTrue);
+  });
+
+  test('folding a memory block never rewrites the conversation store', () async {
+    // The micro-freeze this closes: the fold used to live on the segment inside
+    // `conversations`, so recording one boolean re-encoded every message of every
+    // chat on the UI thread. A view preference costs its own few dozen bytes now.
+    final state = await _state(FakeClient(deltas: ['ok']));
+    await state.send('hi');
+    final id = state.active.id;
+    await state.setSummary(
+      id,
+      ChatSummary(
+        enabled: true,
+        segments: [SummarySegment(id: 'a', content: 'body-a')],
+      ),
+    );
+    final prefs = await SharedPreferences.getInstance();
+    final before = prefs.getString('conversations');
+    expect(before, isNotNull);
+
+    state.setSummarySegmentCollapsed(id, 'a', true);
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+
+    expect(prefs.getString('conversations'), before,
+        reason: 'the big entry must not be touched by a fold');
+    expect(prefs.getString('summaryFolds'), contains('a'));
+
+    // Unfolding it again clears the entry rather than leaving a growing record of
+    // every block anyone ever opened.
+    state.setSummarySegmentCollapsed(id, 'a', false);
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+    expect(prefs.getString('summaryFolds'), isNull);
+    expect(prefs.getString('conversations'), before);
+  });
+
+  test('a fold for a chat that no longer exists is forgotten on load', () async {
+    SharedPreferences.setMockInitialValues(<String, Object>{
+      'summaryFolds': '{"ghost-chat":["a"]}',
+    });
+    final state = AppState(client: FakeClient());
+    await state.init();
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(
+      (await SharedPreferences.getInstance()).getString('summaryFolds'),
+      isNull,
+    );
+  });
+}

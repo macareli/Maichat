@@ -1,0 +1,114 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:maichat/models/character.dart';
+import 'package:maichat/models/chat_interface.dart';
+import 'package:maichat/models/conversation.dart';
+import 'package:maichat/screens/chat_screen.dart';
+import 'package:maichat/state/app_state.dart';
+import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+/// Drives the real [ChatScreen] to check the group bar wiring: the composer's
+/// ⋮ opens the operations strip, its group symbol reveals the participant bar,
+/// and the bar shows a chip per member plus its close control.
+void main() {
+  setUp(() => SharedPreferences.setMockInitialValues(<String, Object>{}));
+
+  Future<AppState> groupChat({bool enabled = true}) async {
+    final state = AppState();
+    await state.init();
+    await state.updateChatInterface(
+        ChatInterface(groupChatsEnabled: enabled));
+    final alice = Character(id: 'alice', name: 'Alice', firstMes: 'Hi.');
+    final bob = Character(id: 'bob', name: 'Bob');
+    await state.addCharacter(alice);
+    await state.addCharacter(bob);
+    state.startChatWithCharacter(alice);
+    await state.addParticipant(state.active.id, bob);
+    return state;
+  }
+
+  Widget host(AppState state) => ChangeNotifierProvider<AppState>.value(
+        value: state,
+        child: const MaterialApp(home: ChatScreen()),
+      );
+
+  testWidgets('the group bar opens from the composer and lists members',
+      (tester) async {
+    final state = await groupChat();
+    await tester.pumpWidget(host(state));
+    await tester.pump();
+    await tester.pump();
+
+    // The operations button is present because group chats are enabled.
+    expect(find.byKey(const Key('composer-ops-button')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('composer-ops-button')));
+    await tester.pumpAndSettle();
+
+    // The group operation symbol appears; tapping it (after the reveal has
+    // settled, proving the animated strip does not clip its hit region) shows
+    // the bar.
+    expect(find.byIcon(Icons.groups_outlined), findsOneWidget);
+    await tester.tap(find.byIcon(Icons.groups_outlined));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Alice'), findsOneWidget);
+    expect(find.text('Bob'), findsOneWidget);
+    // Adding a character is not offered here — that lives in Chat settings.
+    expect(find.widgetWithText(InkWell, 'Add'), findsNothing);
+
+    // The ✕ hides the bar again.
+    await tester.tap(find.byIcon(Icons.close));
+    await tester.pumpAndSettle();
+    expect(find.text('Bob'), findsNothing);
+  });
+
+  testWidgets('the operations button stays when group chats are switched off',
+      (tester) async {
+    final state = await groupChat(enabled: false);
+    await tester.pumpWidget(host(state));
+    await tester.pump();
+    await tester.pump();
+
+    // The button is a permanent home for per-chat actions, so it is here even
+    // with the group feature off — but it offers no group operation.
+    expect(find.byKey(const Key('composer-ops-button')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('composer-ops-button')));
+    await tester.pumpAndSettle();
+    expect(find.byIcon(Icons.groups_outlined), findsNothing);
+    // The picture and studio operations are not gated on group chat, so the
+    // strip still has something in it.
+    expect(find.byKey(const Key('composer-image-button')), findsOneWidget);
+    expect(find.byKey(const Key('composer-imagegen-button')), findsOneWidget);
+  });
+
+  testWidgets('the auto-reply menu sets a responder and toggles it off',
+      (tester) async {
+    final state = await groupChat();
+    await tester.pumpWidget(host(state));
+    await tester.pump();
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('composer-ops-button')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.groups_outlined));
+    await tester.pumpAndSettle();
+
+    // Nobody is chosen yet, so the menu's marker is the outlined voice icon.
+    expect(state.active.groupResponder, isNull);
+    await tester.tap(find.byIcon(Icons.record_voice_over_outlined));
+    await tester.pumpAndSettle();
+
+    // 'Random' is a menu-only entry (no such chip), so it is unambiguous.
+    expect(find.text('Random'), findsOneWidget);
+    await tester.tap(find.text('Random'));
+    await tester.pumpAndSettle();
+    expect(state.active.groupResponder, kGroupResponderRandom);
+
+    // Reopen (the marker is now filled) and tap Random again to clear it.
+    await tester.tap(find.byIcon(Icons.record_voice_over));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Random'));
+    await tester.pumpAndSettle();
+    expect(state.active.groupResponder, isNull);
+  });
+}

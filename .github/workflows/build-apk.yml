@@ -1,0 +1,179 @@
+name: Build APK
+
+# Builds the release APK on pushes and tags to main and on manual dispatch, and
+# attaches it to a GitHub Release on a version tag. Pull requests run analyze +
+# test only (no APK) for fast feedback; the profile APK is built on demand via
+# "Run workflow" (workflow_dispatch), since it is a diagnostic, not a release
+# artifact — building it on every run roughly doubled the wall-clock.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel a superseded run for the same branch/tag when a newer commit lands, so
+# CI never spends minutes finishing a build that is already out of date.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+# Needed so the tag-triggered release step can create a Release and upload to it.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          # Pinned to the toolchain the project is developed against.
+          flutter-version: 3.44.9
+          channel: stable
+          cache: true
+
+      - name: Cache Gradle
+        # flutter-action caches the SDK + pub packages, not Gradle. Caching the
+        # Gradle dependency/wrapper store cuts several minutes off the Android
+        # build on a warm cache. Keyed on the Gradle build files so a dependency
+        # change invalidates it; the restore-keys fall back to the newest cache.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle*', 'android/**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Set up release signing
+        # Decodes the keystore and writes android/key.properties from repo
+        # secrets so the release build is signed with the real key (upgradable
+        # in place). Version tags require a complete release configuration.
+        # Branch and manual builds may use debug signing for development.
+        # Skipped on PRs (no APK).
+        if: github.event_name != 'pull_request'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              echo "::error::Release signing is required for version tags. Configure all four signing secrets."
+              exit 1
+            fi
+            echo "No keystore secret configured; building a development APK with debug signing."
+            exit 0
+          fi
+          for name in KEYSTORE_PASSWORD KEY_PASSWORD KEY_ALIAS; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Incomplete release signing configuration: $name is missing."
+              exit 1
+            fi
+          done
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > android/app/maichat-release.jks
+          cat > android/key.properties <<EOF
+          storePassword=$KEYSTORE_PASSWORD
+          keyPassword=$KEY_PASSWORD
+          keyAlias=$KEY_ALIAS
+          storeFile=maichat-release.jks
+          EOF
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Test
+        run: flutter test
+
+      - name: Build universal APK
+        # One APK that installs on any device — no ABI-picking for the user.
+        # Skipped on PRs, where analyze + test are the gate.
+        #
+        # The Google Drive client is injected here rather than committed: this
+        # repository is public, and while an installed app's client secret is not
+        # a confidential credential (PKCE is what protects the exchange, and the
+        # only scope asked for is `drive.file`), there is no reason to leave it
+        # sitting in the git history. With no secrets configured — a fork, say —
+        # the defines are empty and the app asks for a client of the user's own
+        # instead. See `developer notes/google-drive-oauth.md`.
+        if: github.event_name != 'pull_request'
+        env:
+          DRIVE_CLIENT_ID: ${{ secrets.DRIVE_CLIENT_ID }}
+          DRIVE_CLIENT_SECRET: ${{ secrets.DRIVE_CLIENT_SECRET }}
+        run: |
+          flutter build apk --release \
+            --dart-define=MAICHAT_DRIVE_CLIENT_ID="$DRIVE_CLIENT_ID" \
+            --dart-define=MAICHAT_DRIVE_CLIENT_SECRET="$DRIVE_CLIENT_SECRET"
+
+      - name: Rename to MaiChat-<version>.apk
+        # Give the single output a friendly, versioned name so the download is
+        # obviously "the app", not app-release.apk.
+        if: github.event_name != 'pull_request'
+        run: |
+          VERSION=$(grep '^version:' pubspec.yaml | sed 's/version:[[:space:]]*//' | cut -d'+' -f1)
+          mv build/app/outputs/flutter-apk/app-release.apk \
+             "build/app/outputs/flutter-apk/MaiChat-${VERSION}.apk"
+
+      - name: Upload APK as workflow artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MaiChat-apk
+          path: build/app/outputs/flutter-apk/MaiChat-*.apk
+          if-no-files-found: error
+
+      - name: Build profile APK
+        # A profile build keeps the Dart VM Service open so DevTools can attach
+        # and record a real performance timeline on-device — at near-release
+        # speed. It is a diagnostic, so it only builds on manual dispatch rather
+        # than on every push/tag (it roughly doubled the build time).
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DRIVE_CLIENT_ID: ${{ secrets.DRIVE_CLIENT_ID }}
+          DRIVE_CLIENT_SECRET: ${{ secrets.DRIVE_CLIENT_SECRET }}
+        run: |
+          flutter build apk --profile \
+            --dart-define=MAICHAT_DRIVE_CLIENT_ID="$DRIVE_CLIENT_ID" \
+            --dart-define=MAICHAT_DRIVE_CLIENT_SECRET="$DRIVE_CLIENT_SECRET"
+
+      - name: Rename profile APK
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          VERSION=$(grep '^version:' pubspec.yaml | sed 's/version:[[:space:]]*//' | cut -d'+' -f1)
+          mv build/app/outputs/flutter-apk/app-profile.apk \
+             "build/app/outputs/flutter-apk/MaiChat-${VERSION}-profile.apk"
+
+      - name: Upload profile APK artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MaiChat-profile-apk
+          path: build/app/outputs/flutter-apk/MaiChat-*-profile.apk
+          if-no-files-found: error
+
+      - name: Attach APK to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/app/outputs/flutter-apk/MaiChat-*.apk
+          fail_on_unmatched_files: true
+          generate_release_notes: true

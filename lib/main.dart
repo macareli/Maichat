@@ -1,0 +1,183 @@
+// MaiChat — a mobile-first, UI-driven AI chat frontend.
+// Copyright (C) 2026 Macareli.
+//
+// This program is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free Software
+// Foundation, either version 3 of the License, or (at your option) any later
+// version. It is distributed WITHOUT ANY WARRANTY; see the GNU General Public
+// License for more details. A copy ships with the source, in LICENSE.
+
+import 'package:dynamic_color/dynamic_color.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:provider/provider.dart';
+
+import 'models/appearance.dart';
+import 'screens/home_screen.dart';
+import 'services/avatar_store.dart';
+import 'services/backup_store.dart';
+import 'services/embedding_store.dart';
+import 'services/image_cache_tuning.dart';
+import 'state/app_state.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final imageBudget = imageCacheBudget();
+  final decodedImages = PaintingBinding.instance.imageCache;
+  decodedImages.maximumSize = imageBudget.maximumSize;
+  decodedImages.maximumSizeBytes = imageBudget.maximumSizeBytes;
+  // Draw behind the status and navigation bars so the system chrome takes on
+  // the app's colours instead of sitting in an opaque strip.
+  SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+  // Resolved here, once, before anything can be drawn: character pictures are
+  // files, and the widget that draws one looks the directory up synchronously.
+  final avatars = await AvatarStore.open();
+  // Embedding vectors are files too (never in prefs — see EmbeddingStore).
+  final embeddings = await EmbeddingStore.open();
+  // The folder the app keeps its own backups in, so a scheduled export has
+  // somewhere to write without a save dialog.
+  final backups = await BackupStore.open();
+  runApp(MaiChatApp(
+    avatars: avatars,
+    embeddings: embeddings,
+    backups: backups,
+  ));
+}
+
+class MaiChatApp extends StatelessWidget {
+  const MaiChatApp({super.key, this.avatars, this.embeddings, this.backups});
+
+  /// The pictures directory, or null when the platform would not name one.
+  final AvatarStore? avatars;
+
+  /// The vectors directory, or null when the platform would not name one.
+  final EmbeddingStore? embeddings;
+
+  /// The backups directory, or null when the platform would not name one.
+  final BackupStore? backups;
+
+  @override
+  Widget build(BuildContext context) {
+    return ChangeNotifierProvider<AppState>(
+      create: (_) => AppState(
+        avatars: avatars,
+        embeddings: embeddings,
+        backups: backups,
+      )..init(),
+      // Outside the builder so a late palette does not rebuild app state.
+      child: DynamicColorBuilder(
+        builder: (ColorScheme? lightDynamic, ColorScheme? darkDynamic) {
+          return Consumer<AppState>(
+            builder: (context, state, _) {
+              final appearance = state.appearance;
+              final wanted = appearance.dynamicColor;
+              final seed = Color(appearance.seedColor);
+              final amoled = appearance.mode == AppThemeMode.amoled;
+              return MaterialApp(
+                title: 'MaiChat',
+                debugShowCheckedModeBanner: false,
+                showPerformanceOverlay: state.perfOverlay,
+                themeMode: _themeMode(appearance.mode),
+                theme: themeFor(wanted ? lightDynamic : null, Brightness.light,
+                    seed, fontFamily: appearance.fontFamily),
+                darkTheme: themeFor(
+                  wanted ? darkDynamic : null,
+                  Brightness.dark,
+                  seed,
+                  amoled: amoled,
+                  fontFamily: appearance.fontFamily,
+                ),
+                home: const HomeScreen(),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+
+  static ThemeMode _themeMode(AppThemeMode mode) => switch (mode) {
+        AppThemeMode.system => ThemeMode.system,
+        AppThemeMode.light => ThemeMode.light,
+        AppThemeMode.dark => ThemeMode.dark,
+        AppThemeMode.amoled => ThemeMode.dark,
+      };
+
+  /// [dynamicScheme] is the OS palette when there is one. It is harmonized so
+  /// the error and container roles are nudged towards the wallpaper hue rather
+  /// than clashing with it. [seed] is the user's chosen colour, used when there
+  /// is no dynamic scheme. When [amoled] is set on a dark theme the surfaces are
+  /// pushed to true black so OLED panels can switch those pixels off.
+  ///
+  /// Public because the screenshot generator (`test/screenshots/`) dresses the
+  /// screens it photographs in the app's real theme rather than a lookalike.
+  static ThemeData themeFor(
+    ColorScheme? dynamicScheme,
+    Brightness brightness,
+    Color seed, {
+    bool amoled = false,
+    String? fontFamily,
+  }) {
+    var scheme = dynamicScheme?.harmonized() ??
+        ColorScheme.fromSeed(seedColor: seed, brightness: brightness);
+    if (amoled && brightness == Brightness.dark) {
+      scheme = scheme.copyWith(
+        surface: const Color(0xFF000000),
+        surfaceContainerLowest: const Color(0xFF000000),
+        surfaceContainerLow: const Color(0xFF0A0A0A),
+        surfaceContainer: const Color(0xFF101010),
+        surfaceContainerHigh: const Color(0xFF161616),
+        surfaceContainerHighest: const Color(0xFF1C1C1C),
+      );
+    }
+    final base = ThemeData(
+      colorScheme: scheme,
+      useMaterial3: true,
+      scaffoldBackgroundColor: amoled && brightness == Brightness.dark
+          ? const Color(0xFF000000)
+          : null,
+      appBarTheme: AppBarTheme(
+        backgroundColor: scheme.surface,
+        surfaceTintColor: scheme.surfaceTint,
+        centerTitle: false,
+        systemOverlayStyle: _overlayStyle(scheme.brightness),
+      ),
+      inputDecorationTheme: const InputDecorationTheme(
+        border: OutlineInputBorder(),
+      ),
+    );
+    return _withFont(base, fontFamily);
+  }
+
+  /// Applies a Google Fonts [fontFamily] across the whole text theme, leaving
+  /// the theme untouched when no font is chosen or the family is unknown (a bad
+  /// name must never crash the app at startup).
+  static ThemeData _withFont(ThemeData base, String? fontFamily) {
+    if (fontFamily == null || fontFamily.trim().isEmpty) return base;
+    try {
+      final textTheme = GoogleFonts.getTextTheme(fontFamily, base.textTheme);
+      return base.copyWith(
+        textTheme: textTheme,
+        primaryTextTheme:
+            GoogleFonts.getTextTheme(fontFamily, base.primaryTextTheme),
+      );
+    } catch (_) {
+      return base;
+    }
+  }
+
+  /// Transparent bars with icons contrasting against the app's own surface.
+  static SystemUiOverlayStyle _overlayStyle(Brightness brightness) {
+    final isLight = brightness == Brightness.light;
+    final icons = isLight ? Brightness.dark : Brightness.light;
+    return SystemUiOverlayStyle(
+      statusBarColor: Colors.transparent,
+      statusBarIconBrightness: icons,
+      statusBarBrightness: brightness,
+      systemNavigationBarColor: Colors.transparent,
+      systemNavigationBarIconBrightness: icons,
+      systemNavigationBarContrastEnforced: false,
+    );
+  }
+}

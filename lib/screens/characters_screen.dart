@@ -1,0 +1,1841 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+
+import '../models/character.dart';
+import '../models/folder.dart';
+import '../models/lorebook.dart';
+import '../models/view_prefs.dart';
+import '../services/character_codec.dart';
+import '../services/character_sources.dart';
+import '../services/folder_io.dart';
+import '../state/app_state.dart';
+import '../widgets/adaptive_mosaic.dart';
+import '../widgets/app_drawer.dart';
+import '../widgets/avatar_dots.dart';
+import '../widgets/avatar_image.dart';
+import '../widgets/character_avatar.dart';
+import '../widgets/character_theme_scope.dart';
+import '../widgets/natural_image.dart';
+import '../widgets/smooth_image.dart';
+import '../widgets/tag_filter_sheet.dart';
+import 'character_actions.dart';
+import 'character_editor.dart';
+import 'folders/folder_edit_screen.dart';
+import 'folders/folder_window.dart';
+
+/// How the roster is ordered.
+enum CharacterSort {
+  recent('Recently updated'),
+  added('Recently added'),
+  name('Name (A–Z)');
+
+  const CharacterSort(this.label);
+  final String label;
+}
+
+/// The Characters section: a search bar, sort / tag / view controls, a starred
+/// shelf pinned above the rest, and per-character actions. Characters show as
+/// an avatar grid or a names list; import, create and multi-select live in the
+/// app bar.
+class CharactersScreen extends StatefulWidget {
+  const CharactersScreen({super.key});
+
+  @override
+  State<CharactersScreen> createState() => _CharactersScreenState();
+}
+
+class _CharactersScreenState extends State<CharactersScreen> {
+  final TextEditingController _search = TextEditingController();
+  final Map<String, String> _visibleAvatarRefs = <String, String>{};
+  final Map<String, String> _masonryFrameRefs = <String, String>{};
+  String? _revealedCharacterId;
+  String _query = '';
+  CharacterSort _sort = CharacterSort.recent;
+  final Set<String> _tagFilter = <String>{};
+  bool _selecting = false;
+  final Set<String> _selection = <String>{};
+
+  /// When on, the roster is replaced in place by the folder list — no separate
+  /// screen. The Folders control below the search bar toggles it.
+  bool _showingFolders = false;
+
+  /// Cards or rows, read live from the stored preference rather than mirrored in
+  /// a field — the choice outlives the screen, so the screen must not own it.
+  bool _avatarView(AppState state) =>
+      state.browseLayout(BrowseSection.characters) == BrowseLayout.grid;
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
+  String _visibleAvatar(AppState state, Character character) {
+    final pool = state.avatarPoolFor(character);
+    if (pool.isEmpty) {
+      _visibleAvatarRefs.remove(character.id);
+      return '';
+    }
+    final visible = _visibleAvatarRefs[character.id];
+    if (visible != null && pool.contains(visible)) return visible;
+    return _visibleAvatarRefs[character.id] = character.avatar;
+  }
+
+  String _frameAvatar(Character character) =>
+      _masonryFrameRefs.putIfAbsent(character.id, () => character.avatar);
+
+  void _selectAvatar(AppState state, String characterId, String ref) {
+    _visibleAvatarRefs[characterId] = ref;
+    state.chooseDefaultAvatar(characterId, ref);
+  }
+
+  // --- filtering / sorting -------------------------------------------------
+
+  /// Every tag across the roster, for the tag-filter sheet.
+  List<String> _allTags(List<Character> characters) {
+    final tags = <String>{};
+    for (final c in characters) {
+      tags.addAll(c.tags);
+    }
+    final sorted = tags.toList()..sort();
+    return sorted;
+  }
+
+  /// Applies the text query and tag filter, then the chosen sort.
+  List<Character> _visible(List<Character> characters) {
+    final q = _query.trim().toLowerCase();
+    final result = characters.where((c) {
+      if (_tagFilter.isNotEmpty &&
+          !_tagFilter.every((t) => c.tags.contains(t))) {
+        return false;
+      }
+      if (q.isEmpty) return true;
+      return c.name.toLowerCase().contains(q) ||
+          c.blurb.toLowerCase().contains(q) ||
+          c.tags.any((t) => t.toLowerCase().contains(q));
+    }).toList();
+
+    switch (_sort) {
+      case CharacterSort.recent:
+        result.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+      case CharacterSort.added:
+        result.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+      case CharacterSort.name:
+        result.sort(
+          (a, b) => a.displayName.toLowerCase().compareTo(
+            b.displayName.toLowerCase(),
+          ),
+        );
+    }
+    return result;
+  }
+
+  // --- selection -----------------------------------------------------------
+
+  void _toggleSelect(String id) {
+    setState(() {
+      if (_selection.contains(id)) {
+        _selection.remove(id);
+      } else {
+        _selection.add(id);
+      }
+    });
+  }
+
+  void _exitSelection() => setState(() {
+    _selecting = false;
+    _selection.clear();
+  });
+
+  Future<void> _deleteSelected(AppState state) async {
+    if (_selection.isEmpty) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(
+          'Delete ${_selection.length} character'
+          '${_selection.length == 1 ? '' : 's'}?',
+        ),
+        content: const Text('Existing chats with them are kept.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    for (final id in _selection.toList()) {
+      await state.deleteCharacter(id);
+    }
+    _exitSelection();
+  }
+
+  // --- create / import -----------------------------------------------------
+
+  Future<void> _createNew() async {
+    await openCharacterEditor(context);
+  }
+
+  void _showImportSheet() {
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.add),
+              title: const Text('Create new character'),
+              onTap: () {
+                Navigator.of(sheetContext).pop();
+                _createNew();
+              },
+            ),
+            const Divider(height: 1),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 12, 20, 4),
+              child: Text(
+                'IMPORT FROM',
+                style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                  color: Theme.of(context).colorScheme.primary,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.8,
+                ),
+              ),
+            ),
+            for (final source in characterSources)
+              ListTile(
+                leading: Icon(source.icon),
+                title: Text(source.label),
+                subtitle: Text(source.description),
+                onTap: () {
+                  Navigator.of(sheetContext).pop();
+                  _runSource(source);
+                },
+              ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Collects any input the source needs, fetches, parses and stores the
+  /// card(s). A file source may return several files, and a single JSON file
+  /// may itself hold an array — both fan out into multiple characters.
+  ///
+  /// A card's lorebooks come with it: the books are filed in the library and
+  /// attached to the character, because a card whose world info was silently
+  /// dropped looks like a working import and behaves like a broken character.
+  Future<void> _runSource(CharacterSource source) async {
+    // Capture context-derived objects up front so nothing is read across the
+    // input/fetch async gaps.
+    final state = context.read<AppState>();
+    final messenger = ScaffoldMessenger.of(context);
+
+    String input = '';
+    if (source.inputKind != SourceInputKind.none) {
+      final entered = await _promptForInput(source);
+      if (entered == null) return; // cancelled
+      input = entered;
+    }
+
+    try {
+      final payloads = await source.fetch(input);
+      if (payloads.isEmpty) return; // e.g. file picker cancelled
+      final imported = <Character>[];
+      final books = <Lorebook>[];
+      String? firstError;
+      for (final payload in payloads) {
+        try {
+          for (final bundle in CharacterCodec.parseBundles(
+            payload.bytes,
+            filename: payload.filename,
+          )) {
+            for (final book in bundle.lorebooks) {
+              books.add(book);
+              bundle.character.lorebookIds.add(book.id);
+            }
+            imported.add(bundle.character);
+          }
+        } on CharacterParseException catch (e) {
+          firstError ??= e.message;
+        }
+      }
+      if (!mounted) return;
+      if (imported.isEmpty) {
+        messenger.showSnackBar(
+          SnackBar(
+            content: Text(firstError ?? 'Could not import that character.'),
+          ),
+        );
+        return;
+      }
+      if (books.isNotEmpty) await state.addLorebooks(books);
+      await state.addCharacters(imported);
+      if (!mounted) return;
+      final lore = books.isEmpty
+          ? ''
+          : ' with ${books.length == 1 ? 'its lorebook' : '${books.length} lorebooks'}';
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(
+            imported.length == 1
+                ? 'Imported ${imported.single.displayName}$lore.'
+                : 'Imported ${imported.length} characters$lore.',
+          ),
+        ),
+      );
+      if (imported.length == 1) {
+        openCharacterDetail(context, imported.single.id);
+      }
+    } on CharacterParseException catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text(e.message)));
+    } catch (_) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Could not import that character.')),
+      );
+    }
+  }
+
+  /// A dialog that gathers the pasted text / URL a source asked for.
+  Future<String?> _promptForInput(CharacterSource source) async {
+    final controller = TextEditingController();
+    final multiline = source.inputKind == SourceInputKind.text;
+    final value = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(source.label),
+        content: TextField(
+          controller: controller,
+          autofocus: false,
+          minLines: multiline ? 4 : 1,
+          maxLines: multiline ? 10 : 1,
+          keyboardType: multiline ? TextInputType.multiline : TextInputType.url,
+          decoration: InputDecoration(
+            hintText: source.inputHint,
+            border: const OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(controller.text),
+            child: const Text('Import'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    return value;
+  }
+
+  // --- tag filter ----------------------------------------------------------
+
+  void _showTagFilter(List<String> tags) {
+    if (tags.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No tags on any character yet.')),
+      );
+      return;
+    }
+    showTagFilterSheet(
+      context,
+      tags: tags,
+      selected: _tagFilter,
+      onChanged: () => setState(() {}),
+    );
+  }
+  // --- build ---------------------------------------------------------------
+
+  void _onItemTap(AppState state, Character c, {bool overlay = false}) {
+    if (_selecting) {
+      _toggleSelect(c.id);
+    } else if (overlay && _revealedCharacterId != c.id) {
+      setState(() => _revealedCharacterId = c.id);
+    } else {
+      openCharacterDetail(context, c.id);
+    }
+  }
+
+  void _onItemLongPress(Character c) {
+    setState(() {
+      _revealedCharacterId = null;
+      _selecting = true;
+      _selection.add(c.id);
+    });
+  }
+
+  Future<void> _pickSort() async {
+    final picked = await showModalBottomSheet<CharacterSort>(
+      context: context,
+      showDragHandle: true,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final s in CharacterSort.values)
+              ListTile(
+                title: Text(s.label),
+                trailing: _sort == s ? const Icon(Icons.check) : null,
+                onTap: () => Navigator.of(context).pop(s),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (picked != null) setState(() => _sort = picked);
+  }
+
+  // --- folders -------------------------------------------------------------
+
+  List<String> _allFolderTags(List<Folder> folders) =>
+      ({for (final f in folders) ...f.tags}.toList()..sort());
+
+  List<Folder> _visibleFolders(List<Folder> folders) {
+    final q = _query.trim().toLowerCase();
+    return folders.where((f) {
+        if (_tagFilter.isNotEmpty &&
+            !_tagFilter.every((t) => f.tags.contains(t))) {
+          return false;
+        }
+        return q.isEmpty || f.matches(q);
+      }).toList()
+      ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+  }
+
+  /// Swap the roster for the folder list (and back), resetting the search and
+  /// tag filter since they mean different things in each mode.
+  void _toggleFolders() => setState(() {
+    _showingFolders = !_showingFolders;
+    _selecting = false;
+    _selection.clear();
+    _tagFilter.clear();
+    _query = '';
+    _search.clear();
+  });
+
+  Future<void> _createFolder() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<Folder>(builder: (_) => const FolderEditScreen()),
+    );
+  }
+
+  Future<void> _importFolder(AppState state) async {
+    final folder = await FolderIO.importFolder(context, state);
+    if (folder != null) await state.addFolder(folder);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    if (!state.ready) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    if (_showingFolders) return _foldersScaffold(state);
+    final all = state.characters;
+    final tags = _allTags(all);
+    final visible = _visible(all);
+    final starred = visible.where((c) => c.starred).toList();
+    final others = visible.where((c) => !c.starred).toList();
+    final hasStar = starred.isNotEmpty;
+    final bottom = MediaQuery.paddingOf(context).bottom;
+
+    return Scaffold(
+      drawer: _selecting
+          ? null
+          : const AppDrawer(selected: DrawerSection.characters),
+      appBar: _selecting ? _selectionAppBar(state) : _mainAppBar(),
+      floatingActionButton: _selecting
+          ? null
+          : FloatingActionButton.extended(
+              onPressed: _showImportSheet,
+              icon: const Icon(Icons.add),
+              label: const Text('Add'),
+            ),
+      // The search bar and controls ride at the top of the scroll view (not a
+      // fixed header), so they scroll away as the roster is browsed.
+      body: NotificationListener<ScrollStartNotification>(
+        onNotification: (notification) {
+          if (notification.dragDetails != null &&
+              _revealedCharacterId != null) {
+            setState(() => _revealedCharacterId = null);
+          }
+          return false;
+        },
+        child: CustomScrollView(
+          slivers: [
+            SliverToBoxAdapter(child: _searchAndControls(state, tags)),
+            if (all.isEmpty)
+              SliverFillRemaining(
+                hasScrollBody: false,
+                child: _EmptyRoster(onAdd: _showImportSheet),
+              )
+            else if (visible.isEmpty)
+              const SliverFillRemaining(
+                hasScrollBody: false,
+                child: _NoMatches(),
+              )
+            else ...[
+              if (hasStar) ...[_header('Starred'), _grid(state, starred)],
+              if (others.isNotEmpty) ...[
+                if (hasStar) _header('All characters'),
+                _grid(state, others),
+              ],
+              SliverToBoxAdapter(child: SizedBox(height: 96 + bottom)),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  AppBar _mainAppBar() => AppBar(
+    title: const Text('Characters'),
+    actions: [
+      IconButton(
+        tooltip: 'Import',
+        icon: const Icon(Icons.download_outlined),
+        onPressed: _showImportSheet,
+      ),
+      IconButton(
+        tooltip: 'New character',
+        icon: const Icon(Icons.person_add_alt_1_outlined),
+        onPressed: _createNew,
+      ),
+      IconButton(
+        tooltip: 'Select multiple',
+        icon: const Icon(Icons.checklist_outlined),
+        onPressed: () => setState(() => _selecting = true),
+      ),
+    ],
+  );
+
+  AppBar _selectionAppBar(AppState state) => AppBar(
+    leading: IconButton(
+      icon: const Icon(Icons.close),
+      onPressed: _exitSelection,
+    ),
+    title: Text('${_selection.length} selected'),
+    actions: [
+      IconButton(
+        tooltip: 'Export selected',
+        icon: const Icon(Icons.download_outlined),
+        onPressed: _selection.isEmpty ? null : () => _exportSelected(state),
+      ),
+      IconButton(
+        tooltip: 'Delete selected',
+        icon: const Icon(Icons.delete_outline),
+        onPressed: _selection.isEmpty ? null : () => _deleteSelected(state),
+      ),
+    ],
+  );
+
+  Future<void> _exportSelected(AppState state) async {
+    final chosen = state.characters
+        .where((c) => _selection.contains(c.id))
+        .toList();
+    if (chosen.isEmpty) return;
+    await exportCharacters(context, chosen, booksOf: state.lorebooksOf);
+  }
+
+  Widget _searchAndControls(AppState state, List<String> tags) {
+    final folders = _showingFolders;
+    final avatarView = folders
+        ? state.browseLayout(BrowseSection.folders) == BrowseLayout.grid
+        : _avatarView(state);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 4, 12, 6),
+      child: Column(
+        children: [
+          SearchBar(
+            controller: _search,
+            hintText: folders ? 'Search folders' : 'Search characters',
+            padding: const WidgetStatePropertyAll(
+              EdgeInsets.symmetric(horizontal: 14),
+            ),
+            leading: const Icon(Icons.search),
+            trailing: [
+              if (_query.isNotEmpty)
+                IconButton(
+                  icon: const Icon(Icons.close),
+                  onPressed: () {
+                    _search.clear();
+                    setState(() => _query = '');
+                  },
+                ),
+            ],
+            onChanged: (v) => setState(() => _query = v),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  // Folders have a fixed ordering, so the sort control makes no
+                  // sense there — swap it for a spacer that keeps the row shape.
+                  child: folders
+                      ? const SizedBox.shrink()
+                      : _ControlChip(
+                          icon: Icons.sort,
+                          label: _sort.label,
+                          onTap: _pickSort,
+                        ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              _ControlChip(
+                icon: Icons.label_outline,
+                label: _tagFilter.isEmpty
+                    ? 'Tags'
+                    : '${_tagFilter.length} tag${_tagFilter.length == 1 ? '' : 's'}',
+                selected: _tagFilter.isNotEmpty,
+                onTap: () => _showTagFilter(tags),
+              ),
+              const SizedBox(width: 8),
+              _ControlChip(
+                icon: folders ? Icons.folder : Icons.folder_outlined,
+                label: 'Folders',
+                selected: folders,
+                onTap: _toggleFolders,
+              ),
+              const SizedBox(width: 8),
+              IconButton(
+                tooltip: avatarView ? 'Show as list' : 'Show as grid',
+                icon: Icon(
+                  avatarView
+                      ? Icons.view_list_outlined
+                      : Icons.grid_view_outlined,
+                ),
+                onPressed: () => state.setBrowseLayout(
+                  folders ? BrowseSection.folders : BrowseSection.characters,
+                  avatarView ? BrowseLayout.list : BrowseLayout.grid,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  // --- folders view (in place of the roster) -------------------------------
+
+  Widget _foldersScaffold(AppState state) {
+    final folders = state.folders;
+    final tags = _allFolderTags(folders);
+    final visible = _visibleFolders(folders);
+    final bottom = MediaQuery.paddingOf(context).bottom;
+    return Scaffold(
+      drawer: const AppDrawer(selected: DrawerSection.characters),
+      appBar: AppBar(
+        title: const Text('Characters'),
+        actions: [
+          IconButton(
+            tooltip: 'Import folder',
+            icon: const Icon(Icons.download_outlined),
+            onPressed: () => _importFolder(state),
+          ),
+          IconButton(
+            tooltip: 'New folder',
+            icon: const Icon(Icons.create_new_folder_outlined),
+            onPressed: _createFolder,
+          ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _createFolder,
+        icon: const Icon(Icons.add),
+        label: const Text('New folder'),
+      ),
+      body: CustomScrollView(
+        slivers: [
+          SliverToBoxAdapter(child: _searchAndControls(state, tags)),
+          if (folders.isEmpty)
+            SliverFillRemaining(
+              hasScrollBody: false,
+              child: _EmptyFolders(onCreate: _createFolder),
+            )
+          else if (visible.isEmpty)
+            const SliverFillRemaining(
+              hasScrollBody: false,
+              child: Center(child: Text('No folders match those filters.')),
+            )
+          else
+            _folderList(state, visible),
+          SliverToBoxAdapter(child: SizedBox(height: 96 + bottom)),
+        ],
+      ),
+    );
+  }
+
+  Widget _folderList(AppState state, List<Folder> folders) {
+    final grid = state.browseLayout(BrowseSection.folders) == BrowseLayout.grid;
+    if (grid) {
+      return SliverPadding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+        sliver: SliverGrid.builder(
+          gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+            maxCrossAxisExtent: 220,
+            mainAxisSpacing: 12,
+            crossAxisSpacing: 12,
+            childAspectRatio: 0.88,
+          ),
+          itemCount: folders.length,
+          itemBuilder: (context, index) => _FolderCard(
+            folder: folders[index],
+            onTap: () => showFolderWindow(context, folderId: folders[index].id),
+          ),
+        ),
+      );
+    }
+    return SliverPadding(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      sliver: SliverList.builder(
+        itemCount: folders.length,
+        itemBuilder: (context, index) {
+          final folder = folders[index];
+          return ListTile(
+            leading: _FolderPicture(folder: folder, size: 48),
+            title: Text(folder.displayName),
+            subtitle: Text(
+              '${folder.characterIds.length} character'
+              '${folder.characterIds.length == 1 ? '' : 's'}',
+            ),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => showFolderWindow(context, folderId: folder.id),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _header(String text) => SliverToBoxAdapter(
+    child: Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+      child: Text(
+        text,
+        style: Theme.of(
+          context,
+        ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
+      ),
+    ),
+  );
+
+  Widget _grid(AppState state, List<Character> list) {
+    void tap(Character c) => _onItemTap(state, c);
+    void overlayTap(Character c) => _onItemTap(state, c, overlay: true);
+    void long(Character c) => _onItemLongPress(c);
+
+    if (_avatarView(state)) {
+      final freeSize = state.freeSizeCards(BrowseSection.characters);
+      final imageOverlay = freeSize && state.characterImageOverlay;
+      return SliverPadding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+        sliver: freeSize
+            ? AdaptiveMosaicSliver<Character>(
+                items: list,
+                itemKey: (character) => character.id,
+                imageKey: (character) =>
+                    imageOverlay ? _frameAvatar(character) : character.avatar,
+                ratioOf: (character) => avatarRatio(
+                  imageOverlay ? _frameAvatar(character) : character.avatar,
+                ),
+                maxCrossAxisExtent: 200,
+                mainAxisSpacing: 12,
+                crossAxisSpacing: 12,
+                itemBuilder: (context, character, width, onRatioResolved) =>
+                    imageOverlay
+                    ? _CharacterOverlayCard(
+                        key: ValueKey('character-overlay-${character.id}'),
+                        character: character,
+                        state: state,
+                        frameRef: _frameAvatar(character),
+                        visibleRef: _visibleAvatar(state, character),
+                        revealed: _revealedCharacterId == character.id,
+                        selecting: _selecting,
+                        selected: _selection.contains(character.id),
+                        displayWidth: width,
+                        onRatioResolved: onRatioResolved,
+                        onDefaultAvatar: (ref) =>
+                            _selectAvatar(state, character.id, ref),
+                        onTap: () => overlayTap(character),
+                        onLongPress: () => long(character),
+                        onToggleStar: () =>
+                            state.toggleCharacterStar(character.id),
+                        onAction: (action) => runCharacterAction(
+                          context,
+                          state,
+                          character,
+                          action,
+                        ),
+                      )
+                    : _CharacterCard(
+                        character: character,
+                        selecting: _selecting,
+                        selected: _selection.contains(character.id),
+                        adaptive: true,
+                        displayWidth: width,
+                        onRatioResolved: onRatioResolved,
+                        onTap: () => tap(character),
+                        onLongPress: () => long(character),
+                        onToggleStar: () =>
+                            state.toggleCharacterStar(character.id),
+                        onAction: (action) => runCharacterAction(
+                          context,
+                          state,
+                          character,
+                          action,
+                        ),
+                      ),
+              )
+            : SliverGrid.builder(
+                gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                  maxCrossAxisExtent: 200,
+                  mainAxisSpacing: 12,
+                  crossAxisSpacing: 12,
+                  childAspectRatio: 0.66,
+                ),
+                itemCount: list.length,
+                itemBuilder: (context, i) => _CharacterCard(
+                  character: list[i],
+                  selecting: _selecting,
+                  selected: _selection.contains(list[i].id),
+                  onTap: () => tap(list[i]),
+                  onLongPress: () => long(list[i]),
+                  onToggleStar: () => state.toggleCharacterStar(list[i].id),
+                  onAction: (a) =>
+                      runCharacterAction(context, state, list[i], a),
+                ),
+              ),
+      );
+    }
+    return SliverPadding(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      sliver: SliverList.builder(
+        itemCount: list.length,
+        itemBuilder: (context, i) => _CharacterTile(
+          character: list[i],
+          selecting: _selecting,
+          selected: _selection.contains(list[i].id),
+          onTap: () => tap(list[i]),
+          onLongPress: () => long(list[i]),
+          onToggleStar: () => state.toggleCharacterStar(list[i].id),
+          onAction: (a) => runCharacterAction(context, state, list[i], a),
+        ),
+      ),
+    );
+  }
+}
+
+/// A small pill button used for the sort and tag controls under the search bar.
+class _ControlChip extends StatelessWidget {
+  const _ControlChip({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+    this.selected = false,
+  });
+
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+  final bool selected;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return ActionChip(
+      avatar: Icon(
+        icon,
+        size: 18,
+        color: selected ? scheme.onSecondaryContainer : scheme.onSurfaceVariant,
+      ),
+      label: Text(label),
+      backgroundColor: selected ? scheme.secondaryContainer : null,
+      side: selected ? BorderSide.none : null,
+      onPressed: onTap,
+    );
+  }
+}
+
+class _CharacterOverlayCard extends StatefulWidget {
+  const _CharacterOverlayCard({
+    super.key,
+    required this.character,
+    required this.state,
+    required this.frameRef,
+    required this.visibleRef,
+    required this.revealed,
+    required this.selecting,
+    required this.selected,
+    required this.displayWidth,
+    required this.onRatioResolved,
+    required this.onDefaultAvatar,
+    required this.onTap,
+    required this.onLongPress,
+    required this.onToggleStar,
+    required this.onAction,
+  });
+
+  final Character character;
+  final AppState state;
+  final String frameRef;
+  final String visibleRef;
+  final bool revealed;
+  final bool selecting;
+  final bool selected;
+  final double displayWidth;
+  final ValueChanged<double> onRatioResolved;
+  final ValueChanged<String> onDefaultAvatar;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+  final VoidCallback onToggleStar;
+  final ValueChanged<CharacterAction> onAction;
+
+  @override
+  State<_CharacterOverlayCard> createState() => _CharacterOverlayCardState();
+}
+
+class _CharacterOverlayCardState extends State<_CharacterOverlayCard> {
+  PageController? _pages;
+  List<String> _pool = const <String>[];
+  String _visibleRef = '';
+  int _index = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _adopt();
+  }
+
+  @override
+  void didUpdateWidget(_CharacterOverlayCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final live = widget.state.avatarPoolFor(widget.character);
+    if (!setEquals(live.toSet(), _pool.toSet())) {
+      _adopt(preferred: widget.visibleRef);
+      return;
+    }
+    final visible = _pool.indexOf(widget.visibleRef);
+    if (visible >= 0 && visible != _index) {
+      _visibleRef = widget.visibleRef;
+      _index = visible;
+      _jumpAfterFrame(visible);
+    }
+  }
+
+  @override
+  void dispose() {
+    _pages?.dispose();
+    super.dispose();
+  }
+
+  void _adopt({String? preferred}) {
+    final next = widget.state.avatarPoolFor(widget.character);
+    final ref = preferred != null && next.contains(preferred)
+        ? preferred
+        : (next.contains(widget.visibleRef)
+              ? widget.visibleRef
+              : (next.isEmpty ? '' : next.first));
+    if (ref.isNotEmpty) {
+      final refIndex = next.indexOf(ref);
+      if (refIndex > 0) {
+        next
+          ..removeAt(refIndex)
+          ..insert(0, ref);
+      }
+    }
+    _pool = next;
+    _visibleRef = ref;
+    final preferredIndex = next.indexOf(ref);
+    _index = preferredIndex < 0 ? 0 : preferredIndex;
+    if (_pages == null) {
+      _pages = PageController(initialPage: _index);
+    } else {
+      _jumpAfterFrame(_index);
+    }
+  }
+
+  void _jumpAfterFrame(int page) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final pages = _pages;
+      if (!mounted || pages == null || !pages.hasClients || _pool.isEmpty) {
+        return;
+      }
+      final safePage = page.clamp(0, _pool.length - 1);
+      if (pages.page?.round() != safePage) {
+        pages.jumpToPage(safePage);
+      }
+    });
+  }
+
+  void _onPage(int page) {
+    if (page < 0 || page >= _pool.length) return;
+    final ref = _pool[page];
+    if (ref == _visibleRef && page == _index) return;
+    setState(() {
+      _index = page;
+      _visibleRef = ref;
+    });
+    widget.onDefaultAvatar(ref);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final fallback = _CardFallback(character: widget.character);
+    return CharacterThemeScope(
+      theme: widget.character.theme,
+      child: Builder(
+        builder: (context) => Card(
+          key: ValueKey('character-overlay-card-${widget.character.id}'),
+          clipBehavior: Clip.antiAlias,
+          elevation: 0,
+          margin: EdgeInsets.zero,
+          color: Theme.of(context).colorScheme.surfaceContainerLow,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: widget.selected
+                ? BorderSide(
+                    color: Theme.of(context).colorScheme.primary,
+                    width: 2,
+                  )
+                : BorderSide.none,
+          ),
+          child: Semantics(
+            selected: widget.selected,
+            button: true,
+            label: widget.character.displayName,
+            hint: widget.selecting
+                ? 'Double tap to select'
+                : widget.revealed
+                ? 'Double tap to open'
+                : 'Double tap to show actions',
+            child: InkWell(
+              onTap: widget.onTap,
+              onLongPress: widget.onLongPress,
+              child: NaturalFrame(
+                imageRef: widget.frameRef,
+                displayWidth: widget.displayWidth,
+                maxHeightFactor: double.infinity,
+                onRatioResolved: widget.onRatioResolved,
+                builder: (context, size, image) => Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    // The picture renders into its own layer, kept off the one
+                    // the controls composite. `_RevealedArtworkControls` fades
+                    // itself with an `AnimatedOpacity`, which pushes an offscreen
+                    // `saveLayer`; entering multi-select flips every visible
+                    // card's controls at once, so without this boundary each
+                    // card re-rasterises its avatar into that buffer on every
+                    // frame of the fade — a texture-memory spike that painted the
+                    // avatars black on device, and churn that made the swipe
+                    // stutter. The boundary lets the avatar raster once and stay.
+                    RepaintBoundary(
+                      child: _pool.length < 2
+                          ? (image == null
+                                ? fallback
+                                : SmoothImage(
+                                    image: image,
+                                    fit: BoxFit.cover,
+                                    gaplessPlayback: true,
+                                    errorBuilder: (_, _, _) => fallback,
+                                  ))
+                          : PageView.builder(
+                              key: ValueKey(
+                                'character-avatar-pages-${widget.character.id}',
+                              ),
+                              controller: _pages,
+                              itemCount: _pool.length,
+                              onPageChanged: _onPage,
+                              itemBuilder: (context, index) => _OverlayAvatarPage(
+                                key: ValueKey(
+                                  'character-avatar-${_pool[index]}',
+                                ),
+                                ref: _pool[index],
+                                width: size.width,
+                                fallback: fallback,
+                              ),
+                            ),
+                    ),
+                    _RevealedArtworkControls(
+                      character: widget.character,
+                      index: _index,
+                      count: _pool.length,
+                      revealed: widget.revealed,
+                      selecting: widget.selecting,
+                      selected: widget.selected,
+                      onToggleStar: widget.onToggleStar,
+                      onAction: widget.onAction,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _RevealedArtworkControls extends StatelessWidget {
+  const _RevealedArtworkControls({
+    required this.character,
+    required this.index,
+    required this.count,
+    required this.revealed,
+    required this.selecting,
+    required this.selected,
+    required this.onToggleStar,
+    required this.onAction,
+  });
+
+  final Character character;
+  final int index;
+  final int count;
+  final bool revealed;
+  final bool selecting;
+  final bool selected;
+  final VoidCallback onToggleStar;
+  final ValueChanged<CharacterAction> onAction;
+
+  @override
+  Widget build(BuildContext context) {
+    final shown = revealed || selecting;
+    final scheme = Theme.of(context).colorScheme;
+    return Positioned.fill(
+      child: IgnorePointer(
+        ignoring: !shown,
+        child: ExcludeSemantics(
+          excluding: !shown,
+          child: AnimatedOpacity(
+            opacity: shown ? 1 : 0,
+            duration: const Duration(milliseconds: 160),
+            curve: Curves.easeOut,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                const _ArtworkVignette(),
+                if (!selecting)
+                  Positioned(
+                    top: 4,
+                    left: 4,
+                    child: _GlassIcon(
+                      tooltip: character.starred ? 'Unstar' : 'Star',
+                      icon: character.starred ? Icons.star : Icons.star_border,
+                      color: character.starred ? Colors.amber : null,
+                      onTap: onToggleStar,
+                    ),
+                  ),
+                if (selecting)
+                  Positioned(
+                    top: 8,
+                    right: 8,
+                    child: Icon(
+                      selected
+                          ? Icons.check_circle
+                          : Icons.radio_button_unchecked,
+                      color: selected ? scheme.primary : Colors.white,
+                      shadows: const [Shadow(blurRadius: 4)],
+                    ),
+                  ),
+                if (!selecting && count > 1)
+                  Positioned(
+                    left: 8,
+                    right: 8,
+                    bottom: 38,
+                    child: IgnorePointer(
+                      child: Center(
+                        child: AvatarDots(
+                          count: count,
+                          index: index,
+                          onArtwork: true,
+                        ),
+                      ),
+                    ),
+                  ),
+                if (!selecting)
+                  Positioned(
+                    left: 12,
+                    right: 52,
+                    bottom: 10,
+                    child: IgnorePointer(
+                      child: Text(
+                        character.displayName,
+                        key: ValueKey(
+                          'character-overlay-title-${character.id}',
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w600,
+                          shadows: const [Shadow(blurRadius: 4)],
+                        ),
+                      ),
+                    ),
+                  ),
+                if (!selecting)
+                  Positioned(
+                    right: 4,
+                    bottom: 2,
+                    child: _ArtworkActions(
+                      characterId: character.id,
+                      onAction: onAction,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _OverlayAvatarPage extends StatelessWidget {
+  const _OverlayAvatarPage({
+    super.key,
+    required this.ref,
+    required this.width,
+    required this.fallback,
+  });
+
+  final String ref;
+  final double width;
+  final Widget fallback;
+
+  @override
+  Widget build(BuildContext context) {
+    final provider = avatarImage(
+      ref,
+      displaySize: width,
+      devicePixelRatio: MediaQuery.maybeDevicePixelRatioOf(context) ?? 1,
+    );
+    if (provider == null) return fallback;
+    return Image(
+      image: provider,
+      fit: BoxFit.cover,
+      gaplessPlayback: true,
+      errorBuilder: (_, _, _) => fallback,
+    );
+  }
+}
+
+class _ArtworkVignette extends StatelessWidget {
+  const _ArtworkVignette();
+
+  @override
+  Widget build(BuildContext context) => IgnorePointer(
+    child: Align(
+      alignment: Alignment.bottomCenter,
+      child: Container(
+        height: 92,
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Colors.transparent, Colors.black.withValues(alpha: 0.72)],
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+class _ArtworkActions extends StatelessWidget {
+  const _ArtworkActions({required this.characterId, required this.onAction});
+
+  final String characterId;
+  final ValueChanged<CharacterAction> onAction;
+
+  @override
+  Widget build(BuildContext context) => SizedBox.square(
+    dimension: 48,
+    child: PopupMenuButton<CharacterAction>(
+      key: ValueKey('character-overlay-actions-$characterId'),
+      tooltip: 'Actions',
+      color: Theme.of(context).colorScheme.surfaceContainerHigh,
+      padding: EdgeInsets.zero,
+      icon: const Icon(Icons.more_vert, color: Colors.white, size: 22),
+      onSelected: onAction,
+      itemBuilder: (context) => characterMenuItems(),
+    ),
+  );
+}
+
+/// A character in the avatar grid: the picture up top, and a card-like slot
+/// beneath it carrying the name (with the 3-dot actions menu) and description.
+class _CharacterCard extends StatelessWidget {
+  const _CharacterCard({
+    required this.character,
+    required this.selecting,
+    required this.selected,
+    required this.onTap,
+    required this.onLongPress,
+    required this.onToggleStar,
+    required this.onAction,
+    this.adaptive = false,
+    this.displayWidth,
+    this.onRatioResolved,
+  });
+
+  final Character character;
+  final bool selecting;
+  final bool selected;
+  final bool adaptive;
+  final double? displayWidth;
+  final ValueChanged<double>? onRatioResolved;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+  final VoidCallback onToggleStar;
+  final ValueChanged<CharacterAction> onAction;
+
+  @override
+  Widget build(BuildContext context) {
+    final blurb = character.blurb;
+    // A themed character wears its own colours in the roster too, which is what
+    // makes a library of them readable at a glance rather than a wall of one
+    // accent. The scope is a no-op for a card with no theme.
+    return CharacterThemeScope(
+      theme: character.theme,
+      child: Builder(
+        builder: (context) {
+          final scheme = Theme.of(context).colorScheme;
+          return Card(
+            clipBehavior: Clip.antiAlias,
+            elevation: 0,
+            color: scheme.surfaceContainerLow,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+              side: selected
+                  ? BorderSide(color: scheme.primary, width: 2)
+                  : BorderSide.none,
+            ),
+            child: InkWell(
+              onTap: onTap,
+              onLongPress: onLongPress,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  if (adaptive)
+                    _AdaptiveCardImage(
+                      character: character,
+                      selecting: selecting,
+                      selected: selected,
+                      onToggleStar: onToggleStar,
+                      displayWidth: displayWidth,
+                      onRatioResolved: onRatioResolved,
+                    )
+                  else
+                    Expanded(
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          _CardImage(character: character),
+                          Positioned(
+                            top: 4,
+                            left: 4,
+                            child: _GlassIcon(
+                              icon: character.starred
+                                  ? Icons.star
+                                  : Icons.star_border,
+                              color: character.starred ? Colors.amber : null,
+                              onTap: onToggleStar,
+                            ),
+                          ),
+                          if (selecting)
+                            Positioned(
+                              top: 4,
+                              right: 4,
+                              child: Icon(
+                                selected
+                                    ? Icons.check_circle
+                                    : Icons.radio_button_unchecked,
+                                color: selected
+                                    ? scheme.primary
+                                    : scheme.onSurface,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  // The name/description slot sits on a distinct, slightly stronger
+                  // surface so it reads as a label attached under the avatar.
+                  Container(
+                    width: double.infinity,
+                    color: scheme.surfaceContainerHighest,
+                    padding: const EdgeInsets.fromLTRB(10, 8, 2, 8),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                character.displayName,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: Theme.of(context).textTheme.titleSmall
+                                    ?.copyWith(fontWeight: FontWeight.w600),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                blurb.isEmpty ? 'No description' : blurb,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: Theme.of(context).textTheme.bodySmall
+                                    ?.copyWith(color: scheme.onSurfaceVariant),
+                              ),
+                            ],
+                          ),
+                        ),
+                        if (!selecting)
+                          SizedBox(
+                            width: 32,
+                            child: PopupMenuButton<CharacterAction>(
+                              padding: EdgeInsets.zero,
+                              icon: const Icon(Icons.more_vert, size: 20),
+                              tooltip: 'Actions',
+                              onSelected: onAction,
+                              itemBuilder: (context) => characterMenuItems(),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _AdaptiveCardImage extends StatelessWidget {
+  const _AdaptiveCardImage({
+    required this.character,
+    required this.selecting,
+    required this.selected,
+    required this.onToggleStar,
+    this.displayWidth,
+    this.onRatioResolved,
+  });
+
+  final Character character;
+  final bool selecting;
+  final bool selected;
+  final VoidCallback onToggleStar;
+  final double? displayWidth;
+  final ValueChanged<double>? onRatioResolved;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return NaturalImage(
+      imageRef: character.avatar,
+      maxHeightFactor: double.infinity,
+      displayWidth: displayWidth,
+      onRatioResolved: onRatioResolved,
+      fallback: _CardFallback(character: character),
+      overlay: Stack(
+        children: [
+          Positioned(
+            top: 4,
+            left: 4,
+            child: _GlassIcon(
+              icon: character.starred ? Icons.star : Icons.star_border,
+              color: character.starred ? Colors.amber : null,
+              onTap: onToggleStar,
+            ),
+          ),
+          if (selecting)
+            Positioned(
+              top: 4,
+              right: 4,
+              child: Icon(
+                selected ? Icons.check_circle : Icons.radio_button_unchecked,
+                color: selected ? scheme.primary : scheme.onSurface,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The picture area of a legacy [_CharacterCard], cropped to fill.
+class _CardImage extends StatelessWidget {
+  const _CardImage({required this.character});
+
+  final Character character;
+
+  @override
+  Widget build(BuildContext context) {
+    final fallback = _CardFallback(character: character);
+    final provider = avatarImage(
+      character.avatar,
+      displaySize: 320,
+      devicePixelRatio: MediaQuery.maybeDevicePixelRatioOf(context) ?? 1,
+    );
+    if (provider == null) return fallback;
+    return SmoothImage(
+      image: provider,
+      fit: BoxFit.cover,
+      errorBuilder: (_, _, _) => fallback,
+    );
+  }
+}
+
+class _CardFallback extends StatelessWidget {
+  const _CardFallback({required this.character});
+
+  final Character character;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return ColoredBox(
+      color: scheme.secondaryContainer,
+      child: Center(
+        child: Text(
+          character.displayName.isEmpty
+              ? '?'
+              : character.displayName.characters.first.toUpperCase(),
+          style: TextStyle(
+            fontSize: 44,
+            fontWeight: FontWeight.w600,
+            color: scheme.onSecondaryContainer,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// A translucent, tappable circular icon that floats over the card image
+/// (used for the star toggle).
+class _GlassIcon extends StatelessWidget {
+  const _GlassIcon({
+    required this.icon,
+    required this.onTap,
+    this.color,
+    this.tooltip,
+  });
+
+  final IconData icon;
+  final VoidCallback onTap;
+  final Color? color;
+  final String? tooltip;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final button = Material(
+      color: scheme.surface.withValues(alpha: 0.72),
+      shape: const CircleBorder(),
+      child: InkWell(
+        customBorder: const CircleBorder(),
+        onTap: onTap,
+        child: SizedBox(
+          width: 48,
+          height: 48,
+          child: Center(
+            child: Icon(icon, size: 20, color: color ?? scheme.onSurface),
+          ),
+        ),
+      ),
+    );
+    return tooltip == null ? button : Tooltip(message: tooltip!, child: button);
+  }
+}
+
+/// A character in the names list: avatar, name (+ star), description and the
+/// 3-dot actions menu.
+class _CharacterTile extends StatelessWidget {
+  const _CharacterTile({
+    required this.character,
+    required this.selecting,
+    required this.selected,
+    required this.onTap,
+    required this.onLongPress,
+    required this.onToggleStar,
+    required this.onAction,
+  });
+
+  final Character character;
+  final bool selecting;
+  final bool selected;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+  final VoidCallback onToggleStar;
+  final ValueChanged<CharacterAction> onAction;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final blurb = character.blurb;
+    return Card(
+      elevation: 0,
+      color: scheme.surfaceContainerLow,
+      margin: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+      clipBehavior: Clip.antiAlias,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+        side: selected
+            ? BorderSide(color: scheme.primary, width: 2)
+            : BorderSide.none,
+      ),
+      child: ListTile(
+        onTap: onTap,
+        onLongPress: onLongPress,
+        leading: selecting
+            ? Icon(
+                selected ? Icons.check_circle : Icons.radio_button_unchecked,
+                color: selected ? scheme.primary : scheme.onSurfaceVariant,
+              )
+            : CharacterAvatar(character: character, radius: 22),
+        title: Text(
+          character.displayName,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontWeight: FontWeight.w600),
+        ),
+        subtitle: blurb.isEmpty
+            ? null
+            : Text(blurb, maxLines: 2, overflow: TextOverflow.ellipsis),
+        trailing: selecting
+            ? null
+            : Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    tooltip: character.starred ? 'Unstar' : 'Star',
+                    visualDensity: VisualDensity.compact,
+                    icon: Icon(
+                      character.starred ? Icons.star : Icons.star_border,
+                      color: character.starred ? Colors.amber : null,
+                    ),
+                    onPressed: onToggleStar,
+                  ),
+                  PopupMenuButton<CharacterAction>(
+                    tooltip: 'Actions',
+                    icon: const Icon(Icons.more_vert),
+                    onSelected: onAction,
+                    itemBuilder: (context) => characterMenuItems(),
+                  ),
+                ],
+              ),
+      ),
+    );
+  }
+}
+
+/// Shown when there are no characters at all — a friendly nudge to add one.
+class _EmptyRoster extends StatelessWidget {
+  const _EmptyRoster({required this.onAdd});
+
+  final VoidCallback onAdd;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(32, 0, 32, 64),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.people_alt_outlined, size: 56, color: scheme.outline),
+            const SizedBox(height: 16),
+            Text(
+              'No characters yet',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Create one, or import a SillyTavern / Agnai card — a .json, a '
+              'PNG card, a link, or a JannyAI download.',
+              textAlign: TextAlign.center,
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
+            ),
+            const SizedBox(height: 20),
+            FilledButton.tonalIcon(
+              onPressed: onAdd,
+              icon: const Icon(Icons.add),
+              label: const Text('Add a character'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Shown when a search / tag filter matches nothing.
+class _NoMatches extends StatelessWidget {
+  const _NoMatches();
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(32, 0, 32, 64),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.search_off_outlined, size: 48, color: scheme.outline),
+            const SizedBox(height: 12),
+            Text(
+              'No characters match your search.',
+              textAlign: TextAlign.center,
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// A folder in the roster's folder mode. Tapping opens the folder window.
+class _FolderCard extends StatelessWidget {
+  const _FolderCard({required this.folder, required this.onTap});
+
+  final Folder folder;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Card(
+      margin: EdgeInsets.zero,
+      clipBehavior: Clip.antiAlias,
+      elevation: 0,
+      color: scheme.surfaceContainerLow,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: InkWell(
+        onTap: onTap,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(
+              child: _FolderPicture(folder: folder, size: double.infinity),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    folder.displayName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  Text(
+                    '${folder.characterIds.length} character'
+                    '${folder.characterIds.length == 1 ? '' : 's'}',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _FolderPicture extends StatelessWidget {
+  const _FolderPicture({required this.folder, required this.size});
+  final Folder folder;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    final image = avatarImage(
+      folder.avatar,
+      displaySize: size.isFinite ? size : 220,
+    );
+    final tint = folder.color == 0
+        ? Theme.of(context).colorScheme.secondaryContainer
+        : Color(folder.color).withValues(alpha: 0.22);
+    if (image != null) {
+      return Image(image: image, width: size, height: size, fit: BoxFit.cover);
+    }
+    return ColoredBox(
+      color: tint,
+      child: Center(
+        child: Icon(
+          Icons.folder_rounded,
+          size: size.isFinite ? size * 0.56 : 72,
+          color: folder.color == 0
+              ? Theme.of(context).colorScheme.onSecondaryContainer
+              : Color(folder.color),
+        ),
+      ),
+    );
+  }
+}
+
+class _EmptyFolders extends StatelessWidget {
+  const _EmptyFolders({required this.onCreate});
+  final VoidCallback onCreate;
+
+  @override
+  Widget build(BuildContext context) => Center(
+    child: Padding(
+      padding: const EdgeInsets.all(32),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.folder_open_outlined, size: 56),
+          const SizedBox(height: 16),
+          Text('No folders yet', style: Theme.of(context).textTheme.titleLarge),
+          const SizedBox(height: 8),
+          const Text(
+            'Group characters with the lorebooks, presets, and pictures they use.',
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 20),
+          FilledButton.icon(
+            onPressed: onCreate,
+            icon: const Icon(Icons.add),
+            label: const Text('Create folder'),
+          ),
+        ],
+      ),
+    ),
+  );
+}

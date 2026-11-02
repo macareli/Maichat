@@ -1,0 +1,385 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:maichat/models/character.dart';
+import 'package:maichat/models/lorebook.dart';
+import 'package:maichat/models/scenario.dart';
+import 'package:maichat/models/view_prefs.dart';
+import 'package:maichat/screens/characters_screen.dart';
+import 'package:maichat/screens/library/lorebooks_screen.dart';
+import 'package:maichat/screens/library/scenarios_screen.dart';
+import 'package:maichat/state/app_state.dart';
+import 'package:maichat/widgets/adaptive_mosaic.dart';
+import 'package:maichat/widgets/avatar_image.dart';
+import 'package:maichat/widgets/natural_image.dart';
+import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+/// Cards or rows is a preference, not a gesture: it says how the user likes to
+/// read their own library, so it has to survive closing the app.
+///
+/// Every section used to reset to cards on the next launch, which meant making
+/// the choice again on every single visit. The screen tests below each build the
+/// screen, flip the toggle, then build a *fresh* screen from a *fresh* AppState
+/// reading the same store — the closest a widget test gets to closing the app and
+/// opening it again, and the only shape of test that would have caught this.
+void main() {
+  setUp(() => SharedPreferences.setMockInitialValues(<String, Object>{}));
+
+  Future<AppState> ready() async {
+    final state = AppState();
+    await state.init();
+    return state;
+  }
+
+  Widget host(AppState state, Widget screen) =>
+      ChangeNotifierProvider<AppState>.value(
+        value: state,
+        child: MaterialApp(home: screen),
+      );
+
+  group('the model', () {
+    test('free-size defaults off independently for every picture section', () {
+      const prefs = ViewPrefs();
+      expect(prefs.freeSizeFor(BrowseSection.characters), isFalse);
+      expect(prefs.freeSizeFor(BrowseSection.gallery), isFalse);
+      expect(prefs.freeSizeFor(BrowseSection.discover), isFalse);
+    });
+
+    test('free-size sections are remembered one at a time', () {
+      final prefs = const ViewPrefs().withFreeSize(BrowseSection.gallery, true);
+      expect(prefs.freeSizeFor(BrowseSection.characters), isFalse);
+      expect(prefs.freeSizeFor(BrowseSection.gallery), isTrue);
+      expect(prefs.freeSizeFor(BrowseSection.discover), isFalse);
+    });
+
+    test('character artwork labels are opt-in, compact and type-safe', () {
+      const initial = ViewPrefs();
+      expect(initial.characterImageOverlay, isFalse);
+      expect(initial.toJson(), isNot(contains('characterImageOverlay')));
+
+      final enabled = initial.withCharacterImageOverlay(true);
+      expect(enabled.characterImageOverlay, isTrue);
+      expect(enabled.toJson()['characterImageOverlay'], isTrue);
+      expect(ViewPrefs.fromJson(enabled.toJson()), enabled);
+      expect(enabled, isNot(initial));
+
+      final copied = enabled
+          .withFreeSize(BrowseSection.characters, true)
+          .withLayout(BrowseSection.characters, BrowseLayout.list)
+          .withCreatorVersion(CreatorVersion.v1);
+      expect(copied.characterImageOverlay, isTrue);
+
+      final disabled = enabled.withCharacterImageOverlay(false);
+      expect(disabled.characterImageOverlay, isFalse);
+      expect(disabled.toJson(), isNot(contains('characterImageOverlay')));
+      for (final malformed in <Object?>[null, false, 1, 'true', <Object>[]]) {
+        expect(
+          ViewPrefs.fromJson(<String, dynamic>{
+            'characterImageOverlay': malformed,
+          }).characterImageOverlay,
+          isFalse,
+        );
+      }
+    });
+
+    test('free-size round-trips and junk reads as off', () {
+      final enabled = const ViewPrefs()
+          .withFreeSize(BrowseSection.characters, true)
+          .withFreeSize(BrowseSection.discover, true);
+      expect(ViewPrefs.fromJson(enabled.toJson()), enabled);
+
+      final disabled = enabled.withFreeSize(BrowseSection.characters, false);
+      expect(disabled.freeSizeFor(BrowseSection.characters), isFalse);
+      expect(ViewPrefs.fromJson(disabled.toJson()), disabled);
+      expect(
+        ViewPrefs.fromJson(<String, dynamic>{
+          'freeSize': 'nonsense',
+        }).freeSizeFor(BrowseSection.gallery),
+        isFalse,
+      );
+      expect(
+        ViewPrefs.fromJson(<String, dynamic>{
+          'freeSize': <String, dynamic>{'gallery': 'yes'},
+        }).freeSizeFor(BrowseSection.gallery),
+        isFalse,
+      );
+    });
+
+    test('an unset section falls back to the grid', () {
+      const prefs = ViewPrefs();
+      expect(prefs.layoutFor(BrowseSection.characters), BrowseLayout.grid);
+      expect(
+        prefs.layoutFor(BrowseSection.lorebooks, fallback: BrowseLayout.list),
+        BrowseLayout.list,
+      );
+    });
+
+    test('sections are remembered one at a time', () {
+      final prefs = const ViewPrefs().withLayout(
+        BrowseSection.characters,
+        BrowseLayout.list,
+      );
+      expect(prefs.layoutFor(BrowseSection.characters), BrowseLayout.list);
+      expect(prefs.layoutFor(BrowseSection.lorebooks), BrowseLayout.grid);
+      expect(prefs.layoutFor(BrowseSection.scenarios), BrowseLayout.grid);
+    });
+
+    test('it round-trips through JSON, and junk reads as defaults', () {
+      final prefs = const ViewPrefs().withLayout(
+        BrowseSection.scenarios,
+        BrowseLayout.list,
+      );
+      final back = ViewPrefs.fromJson(prefs.toJson());
+      expect(back, prefs);
+      expect(back.layoutFor(BrowseSection.scenarios), BrowseLayout.list);
+      expect(
+        ViewPrefs.fromJson(<String, dynamic>{
+          'layouts': 'nonsense',
+        }).layoutFor(BrowseSection.scenarios),
+        BrowseLayout.grid,
+      );
+      expect(
+        ViewPrefs.fromJson(<String, dynamic>{
+          'layouts': {'characters': 'sideways'},
+        }).layoutFor(BrowseSection.characters),
+        BrowseLayout.grid,
+      );
+    });
+  });
+
+  group('persistence', () {
+    test('free-size preferences outlive AppState independently', () async {
+      final first = await ready();
+      await first.setFreeSizeCards(BrowseSection.gallery, true);
+      await first.setFreeSizeCards(BrowseSection.discover, true);
+
+      final second = await ready();
+      expect(second.freeSizeCards(BrowseSection.characters), isFalse);
+      expect(second.freeSizeCards(BrowseSection.gallery), isTrue);
+      expect(second.freeSizeCards(BrowseSection.discover), isTrue);
+    });
+
+    test('setting the effective free-size default is a no-op', () async {
+      final state = await ready();
+      var notices = 0;
+      state.addListener(() => notices++);
+      await state.setFreeSizeCards(BrowseSection.characters, false);
+      expect(notices, 0);
+      await state.setFreeSizeCards(BrowseSection.characters, true);
+      expect(notices, 1);
+      await state.setFreeSizeCards(BrowseSection.characters, true);
+      expect(notices, 1);
+    });
+
+    test('turning free-size off is persisted', () async {
+      final first = await ready();
+      await first.setFreeSizeCards(BrowseSection.gallery, true);
+      await first.setFreeSizeCards(BrowseSection.gallery, false);
+      final second = await ready();
+      expect(second.freeSizeCards(BrowseSection.gallery), isFalse);
+    });
+
+    test(
+      'character artwork labels persist with one notice per change',
+      () async {
+        final first = await ready();
+        var notices = 0;
+        first.addListener(() => notices++);
+
+        await first.setCharacterImageOverlay(false);
+        expect(notices, 0);
+        await first.setCharacterImageOverlay(true);
+        expect(notices, 1);
+        await first.setCharacterImageOverlay(true);
+        expect(notices, 1);
+
+        final second = await ready();
+        expect(second.characterImageOverlay, isTrue);
+        await second.setCharacterImageOverlay(false);
+        final third = await ready();
+        expect(third.characterImageOverlay, isFalse);
+      },
+    );
+
+    test('a layout outlives the AppState that chose it', () async {
+      final first = await ready();
+      await first.setBrowseLayout(BrowseSection.characters, BrowseLayout.list);
+      await first.setBrowseLayout(BrowseSection.lorebooks, BrowseLayout.list);
+
+      final second = await ready();
+      expect(second.browseLayout(BrowseSection.characters), BrowseLayout.list);
+      expect(second.browseLayout(BrowseSection.lorebooks), BrowseLayout.list);
+      // Untouched sections are still on the default.
+      expect(second.browseLayout(BrowseSection.scenarios), BrowseLayout.grid);
+    });
+
+    test('setting the layout it already has writes nothing new', () async {
+      final state = await ready();
+      var notices = 0;
+      state.addListener(() => notices++);
+      await state.setBrowseLayout(BrowseSection.characters, BrowseLayout.grid);
+      expect(notices, 0, reason: 'the grid was already the layout');
+      await state.setBrowseLayout(BrowseSection.characters, BrowseLayout.list);
+      expect(notices, 1);
+    });
+
+    test('going back to the grid is remembered too', () async {
+      final first = await ready();
+      await first.setBrowseLayout(BrowseSection.scenarios, BrowseLayout.list);
+      await first.setBrowseLayout(BrowseSection.scenarios, BrowseLayout.grid);
+      final second = await ready();
+      expect(second.browseLayout(BrowseSection.scenarios), BrowseLayout.grid);
+    });
+  });
+  group('the screens', () {
+    /// Flips [screen]'s cards/rows toggle, then rebuilds the screen from a fresh
+    /// AppState over the same store and reports what layout it came back in.
+    Future<void> survivesRestart(
+      WidgetTester tester, {
+      required Widget Function() screen,
+      required Future<void> Function(AppState) seed,
+    }) async {
+      final first = await ready();
+      await seed(first);
+      await tester.pumpWidget(host(first, screen()));
+      await tester.pumpAndSettle();
+
+      // Cards to begin with: the toggle offers the other one.
+      expect(find.byTooltip('Show as list'), findsOneWidget);
+      expect(find.byType(SliverGrid), findsOneWidget);
+
+      await tester.tap(find.byTooltip('Show as list'));
+      await tester.pumpAndSettle();
+      expect(find.byTooltip('Show as grid'), findsOneWidget);
+      expect(find.byType(SliverList), findsWidgets);
+
+      // Close the app and open it again.
+      final second = await ready();
+      await tester.pumpWidget(host(second, screen()));
+      await tester.pumpAndSettle();
+      expect(
+        find.byTooltip('Show as grid'),
+        findsOneWidget,
+        reason: 'the chosen layout did not survive a restart',
+      );
+      expect(find.byType(SliverGrid), findsNothing);
+    }
+
+    testWidgets('Characters keeps the layout it was left in', (tester) async {
+      await survivesRestart(
+        tester,
+        screen: () => const CharactersScreen(),
+        seed: (state) => state.addCharacter(Character(id: 'a', name: 'Aria')),
+      );
+    });
+
+    testWidgets('Lorebooks keeps the layout it was left in', (tester) async {
+      await survivesRestart(
+        tester,
+        screen: () => const LorebooksScreen(),
+        seed: (state) => state.addLorebook(Lorebook(id: 'k', name: 'Kingdom')),
+      );
+    });
+
+    testWidgets('Scenarios keeps the layout it was left in', (tester) async {
+      await survivesRestart(
+        tester,
+        screen: () => const ScenariosScreen(),
+        seed: (state) => state.addScenario(
+          Scenario(id: 's', name: 'Snowed in', text: 'The radio is dead.'),
+        ),
+      );
+    });
+
+    testWidgets('each section is remembered on its own', (tester) async {
+      final first = await ready();
+      await first.addCharacter(Character(id: 'a', name: 'Aria'));
+      await first.addLorebook(Lorebook(id: 'k', name: 'Kingdom'));
+
+      await tester.pumpWidget(host(first, const CharactersScreen()));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Show as list'));
+      await tester.pumpAndSettle();
+
+      // Lorebooks was never touched, so it is still on cards.
+      final second = await ready();
+      await tester.pumpWidget(host(second, const LorebooksScreen()));
+      await tester.pumpAndSettle();
+      expect(find.byTooltip('Show as list'), findsOneWidget);
+      expect(find.byType(SliverGrid), findsOneWidget);
+    });
+
+    testWidgets('Characters uses adaptive natural frames only in grid mode', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(424, 900);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      clearAvatarImageCache();
+      addTearDown(clearAvatarImageCache);
+
+      const wide = 'https://example.invalid/wide.png';
+      const square = 'https://example.invalid/square.png';
+      const portrait = 'https://example.invalid/portrait.png';
+      noteAvatarRatio(wide, 16 / 9);
+      noteAvatarRatio(square, 1);
+      noteAvatarRatio(portrait, 3 / 4);
+      final state = await ready();
+      final now = DateTime(2026, 9, 10);
+      await state.addCharacters([
+        Character(id: 'wide', name: 'Wide', avatar: wide, updatedAt: now),
+        Character(
+          id: 'square',
+          name: 'Square',
+          avatar: square,
+          updatedAt: now.subtract(const Duration(seconds: 1)),
+        ),
+        Character(
+          id: 'portrait',
+          name: 'Portrait',
+          avatar: portrait,
+          updatedAt: now.subtract(const Duration(seconds: 2)),
+        ),
+      ]);
+
+      await tester.pumpWidget(host(state, const CharactersScreen()));
+      await tester.pump();
+      await state.setFreeSizeCards(BrowseSection.characters, true);
+      await tester.pump();
+      await tester.pump();
+      expect(find.byType(SliverGrid), findsNothing);
+      expect(find.byType(AdaptiveMosaicSliver<Character>), findsOneWidget);
+      expect(find.byKey(naturalImageFrameKey), findsNWidgets(3));
+
+      final wideFrame = find.descendant(
+        of: find.byKey(const ValueKey<Object>('wide')),
+        matching: find.byKey(naturalImageFrameKey),
+      );
+      final squareFrame = find.descendant(
+        of: find.byKey(const ValueKey<Object>('square')),
+        matching: find.byKey(naturalImageFrameKey),
+      );
+      final portraitFrame = find.descendant(
+        of: find.byKey(const ValueKey<Object>('portrait')),
+        matching: find.byKey(naturalImageFrameKey),
+      );
+      expect(find.byKey(const ValueKey<Object>('wide')), findsOneWidget);
+      expect(wideFrame, findsOneWidget);
+      expect(tester.getSize(wideFrame).aspectRatio, closeTo(16 / 9, 0.001));
+      expect(tester.getSize(squareFrame).aspectRatio, closeTo(1, 0.001));
+      expect(tester.getSize(portraitFrame).aspectRatio, closeTo(3 / 4, 0.001));
+      expect(tester.getSize(wideFrame).width, 392);
+      expect(tester.getSize(squareFrame).width, 186);
+      expect(
+        tester.getTopLeft(squareFrame).dy,
+        tester.getTopLeft(portraitFrame).dy,
+      );
+
+      await tester.tap(find.byTooltip('Show as list'));
+      await tester.pumpAndSettle();
+      expect(find.byType(AdaptiveMosaicSliver<Character>), findsNothing);
+      expect(find.byKey(naturalImageFrameKey), findsNothing);
+      expect(find.byType(SliverList), findsWidgets);
+    });
+  });
+}
