@@ -4,14 +4,19 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/appearance.dart';
 import '../models/backup.dart';
+import '../models/btw_conversation.dart';
 import '../models/character.dart';
 import '../models/chat_interface.dart';
+import '../models/chat_tool.dart';
 import '../models/conversation.dart';
 import '../models/discover.dart';
 import '../models/embedding.dart';
 import '../models/folder.dart';
 import '../models/gallery_image.dart';
+import '../models/home_layout.dart';
+import '../models/home_note.dart';
 import '../models/image_gen.dart';
+import '../models/studio.dart';
 import '../models/interface_preset.dart';
 import '../models/lorebook.dart';
 import '../models/preset.dart';
@@ -66,11 +71,16 @@ class Storage {
   static const _viewPrefsKey = 'viewPrefs';
   static const _interfacePresetsKey = 'interfacePresets';
   static const _imageGenKey = 'imageGen';
+  static const _studioConfigKey = 'studioConfig';
   static const _summaryFoldsKey = 'summaryFolds';
   static const _responseHintsKey = 'responseHints';
   static const _backupPrefsKey = 'backupPrefs';
   static const _backupsKey = 'backups';
   static const _imageRatiosKey = 'imageRatios';
+  static const _homeLayoutKey = 'homeLayout';
+  static const _homeNotesKey = 'homeNotes';
+  static const _btwThreadsKey = 'btwThreads';
+  static const _btwSettingsKey = 'btwSettings';
 
   /// The usage/cost ledger. Its own entry, kept apart from `providers`, because
   /// it is written after every reply where a provider is written almost never —
@@ -78,6 +88,75 @@ class Storage {
   static const _usageKey = 'usage';
 
   Future<SharedPreferences> get _prefs => SharedPreferences.getInstance();
+
+  Future<List<BtwConversation>> loadBtwThreads() async {
+    final raw = (await _prefs).getString(_btwThreadsKey);
+    if (raw == null) return [];
+    // Authored side conversations must not be overwritten after a corrupt
+    // read. Let AppState's startup guard make that session read-only.
+    final values = jsonDecode(raw);
+    if (values is! List) {
+      throw const FormatException('Invalid side conversations.');
+    }
+    final threads = <BtwConversation>[];
+    final ids = <String>{};
+    for (final value in values) {
+      final thread = BtwConversation.fromJson(value);
+      if (thread == null || !ids.add(thread.id)) {
+        throw const FormatException('Invalid side conversation.');
+      }
+      threads.add(thread);
+    }
+    return threads;
+  }
+
+  Future<void> saveBtwThreads(List<BtwConversation> threads) async {
+    final encoded = jsonEncode([for (final thread in threads) thread.toJson()]);
+    await saveBtwThreadsJson(encoded);
+  }
+
+  Future<void> saveBtwThreadsJson(String encoded) async {
+    if (!await (await _prefs).setString(_btwThreadsKey, encoded)) {
+      throw StateError('Could not save side conversations.');
+    }
+  }
+
+  Future<BtwSettings> loadBtwSettings() async {
+    final raw = (await _prefs).getString(_btwSettingsKey);
+    if (raw == null) return const BtwSettings();
+    try {
+      return BtwSettings.fromJson(
+        Map<String, dynamic>.from(jsonDecode(raw) as Map),
+      );
+    } catch (_) {
+      return const BtwSettings();
+    }
+  }
+
+  Future<void> saveBtwSettings(BtwSettings settings) async {
+    if (!await (await _prefs).setString(
+      _btwSettingsKey,
+      jsonEncode(settings.toJson()),
+    )) {
+      throw StateError('Could not save side conversation settings.');
+    }
+  }
+
+  Future<ChatToolConfig> loadChatTools() async {
+    final raw = (await _prefs).getString('chatTools');
+    if (raw == null) return const ChatToolConfig();
+    final json = jsonDecode(raw);
+    return ChatToolConfig.fromJson(Map<String, dynamic>.from(json as Map));
+  }
+
+  Future<void> saveChatTools(ChatToolConfig config) async {
+    if (!await (await _prefs).setString(
+      'chatTools',
+      jsonEncode(config.toJson()),
+    )) {
+      throw StateError('Could not save tool settings.');
+    }
+  }
 
   /// Loads the configured providers. If none are stored yet, a legacy
   /// single-provider [AppSettings] entry (from before multi-provider support)
@@ -201,11 +280,13 @@ class Storage {
     return <Conversation>[];
   }
 
-  Future<void> saveConversations(List<Conversation> conversations) async =>
-      (await _prefs).setString(
-        _conversationsKey,
-        jsonEncode(conversations.map((c) => c.toJson()).toList()),
-      );
+  Future<void> saveConversations(List<Conversation> conversations) async {
+    final saved = await (await _prefs).setString(
+      _conversationsKey,
+      jsonEncode(conversations.map((c) => c.toJson()).toList()),
+    );
+    if (!saved) throw StateError('Could not save conversations.');
+  }
 
   Future<String?> loadActiveId() async => (await _prefs).getString(_activeKey);
 
@@ -372,6 +453,42 @@ class Storage {
   Future<void> saveViewPrefs(ViewPrefs prefs) async =>
       (await _prefs).setString(_viewPrefsKey, jsonEncode(prefs.toJson()));
 
+  /// How the Home screen is arranged. Its own small entry, written once when an
+  /// edit is finished — never per drag — and copied by a backup like any other.
+  Future<HomeLayout> loadHomeLayout() async {
+    final raw = (await _prefs).getString(_homeLayoutKey);
+    if (raw == null) return HomeLayout.defaults();
+    try {
+      return HomeLayout.fromJson(jsonDecode(raw));
+    } catch (_) {
+      return HomeLayout.defaults();
+    }
+  }
+
+  Future<void> saveHomeLayout(HomeLayout layout) async =>
+      (await _prefs).setString(_homeLayoutKey, jsonEncode(layout.toJson()));
+
+  /// The Home screen's notes, by id. Their own entry — see [HomeNote].
+  Future<List<HomeNote>> loadHomeNotes() async {
+    final raw = (await _prefs).getString(_homeNotesKey);
+    if (raw == null) return const [];
+    try {
+      final json = jsonDecode(raw);
+      if (json is List) {
+        return [for (final n in json) ?HomeNote.fromJson(n)];
+      }
+    } catch (_) {
+      // Defaults beat a startup failure, as everywhere else here.
+    }
+    return const [];
+  }
+
+  Future<void> saveHomeNotes(List<HomeNote> notes) async =>
+      (await _prefs).setString(
+        _homeNotesKey,
+        jsonEncode([for (final n in notes) n.toJson()]),
+      );
+
   /// The user's saved chat-interface looks. Its own small entry, so saving a look
   /// never rewrites the conversations blob — and so a backup, which copies the
   /// store entry by entry, carries them without knowing what they are.
@@ -418,6 +535,23 @@ class Storage {
 
   Future<void> saveImageGen(ImageGenConfig config) async =>
       (await _prefs).setString(_imageGenKey, jsonEncode(config.toJson()));
+
+  /// How the Character Studio talks to its model. A small entry of its own; the
+  /// sessions themselves are files (`StudioStore`), never preferences.
+  Future<StudioConfig> loadStudioConfig() async {
+    final raw = (await _prefs).getString(_studioConfigKey);
+    if (raw == null) return const StudioConfig();
+    try {
+      final json = jsonDecode(raw);
+      if (json is Map<String, dynamic>) return StudioConfig.fromJson(json);
+    } catch (_) {
+      // Defaults beat a startup failure.
+    }
+    return const StudioConfig();
+  }
+
+  Future<void> saveStudioConfig(StudioConfig config) async =>
+      (await _prefs).setString(_studioConfigKey, jsonEncode(config.toJson()));
 
   /// Which memory blocks are folded shut, as `{conversationId: [segmentId, …]}`.
   ///

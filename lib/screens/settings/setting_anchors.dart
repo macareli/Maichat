@@ -9,7 +9,10 @@ enum SettingAnchor {
   // still deep-link.
   theme,
   systemColours,
+  expressive,
+  palette,
   font,
+  chatMenuStyle,
   charactersFreeSize,
   characterImageOverlay,
   galleryFreeSize,

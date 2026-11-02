@@ -1,6 +1,8 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../app_info.dart';
 import '../models/view_prefs.dart';
 import '../state/app_state.dart';
 import 'backups/backups_screen.dart';
@@ -12,6 +14,8 @@ import 'settings/appearance_settings_page.dart';
 import 'settings/browse_appearance_settings_page.dart';
 import 'settings/character_settings_page.dart';
 import 'settings/chat_behaviour_page.dart';
+import 'settings/chat_tools_page.dart';
+import 'settings/btw_settings_page.dart';
 import 'settings/chat_interface_settings_page.dart';
 import 'settings/chat_interface/actions_page.dart';
 import 'settings/chat_interface/avatars_page.dart';
@@ -73,6 +77,18 @@ class SettingsScreen extends StatelessWidget {
             onTap: () => _open(context, const ChatBehaviourPage()),
           ),
           _SectionTile(
+            icon: Icons.build_outlined,
+            title: 'Tool calls',
+            subtitle: 'Dice, trackers and custom chat actions',
+            onTap: () => _open(context, const ChatToolsPage()),
+          ),
+          _SectionTile(
+            icon: Icons.forum_outlined,
+            title: 'Side conversations',
+            subtitle: '${state.btwSettings.titleMode.label} titles · /btw',
+            onTap: () => _open(context, const BtwSettingsPage()),
+          ),
+          _SectionTile(
             icon: Icons.person_outline,
             title: 'Characters',
             subtitle:
@@ -95,7 +111,7 @@ class SettingsScreen extends StatelessWidget {
           _SectionTile(
             icon: Icons.info_outline,
             title: 'About',
-            subtitle: 'Version ${AboutSettingsPage.version}',
+            subtitle: 'Version $kAppVersionLabel',
             onTap: () => _open(context, const AboutSettingsPage()),
           ),
         ],
@@ -269,7 +285,8 @@ const List<_SearchEntry> _searchIndex = [
     section: 'Providers',
     icon: Icons.calculate_outlined,
     keywords:
-        'token count tokenizer tiktoken openai anthropic claude bpe '
+        'token count tokenizer tiktoken openai anthropic claude bpe off '
+        'disable local estimate memory '
         'cl100k o200k context window encoding custom',
     builder: _tokenizerPage,
   ),
@@ -288,11 +305,34 @@ const List<_SearchEntry> _searchIndex = [
     builder: _systemColoursPage,
   ),
   _SearchEntry(
+    title: 'Expressive theme',
+    section: 'Appearance',
+    icon: Icons.auto_awesome_outlined,
+    keywords: 'material 3 expressive m3 bold shapes rounded motion style',
+    builder: _expressivePage,
+  ),
+  _SearchEntry(
+    title: 'Palette style',
+    section: 'Appearance',
+    icon: Icons.gradient_outlined,
+    keywords: 'vibrant tonal muted colourful colorful scheme variant palette',
+    builder: _palettePage,
+  ),
+  _SearchEntry(
     title: 'App font',
     section: 'Appearance',
     icon: Icons.font_download_outlined,
     keywords: 'font typeface google fonts family typography text',
     builder: _fontPage,
+  ),
+  _SearchEntry(
+    title: 'Chat menu style',
+    section: 'Appearance',
+    icon: Icons.view_sidebar_outlined,
+    keywords:
+        'menu drawer sidebar slide overlay push cover phone mobile chat '
+        'style layout',
+    builder: _chatMenuStylePage,
   ),
   _SearchEntry(
     title: 'Characters free-size cards',
@@ -419,6 +459,21 @@ const List<_SearchEntry> _searchIndex = [
     builder: _responseHintPage,
   ),
   _SearchEntry(
+    title: 'Tool calls',
+    section: 'Chat behaviour',
+    icon: Icons.build_outlined,
+    keywords:
+        'tools dice random tracker stats custom recipe import export btw ooc',
+    builder: _chatToolsPage,
+  ),
+  _SearchEntry(
+    title: 'Side conversation titles',
+    section: 'Side conversations',
+    icon: Icons.forum_outlined,
+    keywords: 'btw side ooc title first line ai generated saved thread',
+    builder: _btwSettingsPage,
+  ),
+  _SearchEntry(
     title: 'Character creator',
     section: 'Characters',
     icon: Icons.edit_note_outlined,
@@ -479,8 +534,14 @@ Widget _themePage() =>
     const AppearanceSettingsPage(highlight: SettingAnchor.theme);
 Widget _systemColoursPage() =>
     const AppearanceSettingsPage(highlight: SettingAnchor.systemColours);
+Widget _expressivePage() =>
+    const AppearanceSettingsPage(highlight: SettingAnchor.expressive);
+Widget _palettePage() =>
+    const AppearanceSettingsPage(highlight: SettingAnchor.palette);
 Widget _fontPage() =>
     const AppearanceSettingsPage(highlight: SettingAnchor.font);
+Widget _chatMenuStylePage() =>
+    const AppearanceSettingsPage(highlight: SettingAnchor.chatMenuStyle);
 Widget _charactersFreeSizePage() => const BrowseAppearanceSettingsPage(
   highlight: SettingAnchor.charactersFreeSize,
 );
@@ -514,6 +575,8 @@ Widget _responseHintPage() =>
 Widget _characterCreatorPage() =>
     const CharacterSettingsPage(highlight: SettingAnchor.characterCreator);
 Widget _storagePage() => const StorageSettingsPage();
+Widget _chatToolsPage() => const ChatToolsPage();
+Widget _btwSettingsPage() => const BtwSettingsPage();
 Widget _backupsPage() => const BackupsScreen();
 Widget _backupImportPage() => const BackupImportScreen();
 Widget _drivePage() => const DriveSettingsPage();
@@ -532,9 +595,21 @@ class _SettingsSearch extends StatelessWidget {
       barLeading: const Icon(Icons.search),
       suggestionsBuilder: (context, controller) {
         final needle = controller.text.trim().toLowerCase();
-        final results = needle.isEmpty
+        // The chat-menu row is a phone-only setting, so its search entry is too.
+        final platform = Theme.of(context).platform;
+        final mobilePhone =
+            !kIsWeb &&
+            (platform == TargetPlatform.android ||
+                platform == TargetPlatform.iOS) &&
+            MediaQuery.sizeOf(context).width < 720;
+        final candidates = mobilePhone
             ? _searchIndex
-            : _searchIndex.where((e) => e.matches(needle)).toList();
+            : _searchIndex
+                  .where((e) => e.title != 'Chat menu style')
+                  .toList(growable: false);
+        final results = needle.isEmpty
+            ? candidates
+            : candidates.where((e) => e.matches(needle)).toList();
         if (results.isEmpty) {
           return const [
             Padding(
