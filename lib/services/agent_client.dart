@@ -1,0 +1,1185 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:http/http.dart' as http;
+
+import '../models/agent_message.dart';
+import '../models/message_image.dart';
+import '../models/provider.dart';
+import '../models/usage.dart';
+import 'chat_client.dart';
+
+/// Sampling for one agent turn. Smaller than [GenParams] on purpose: an agent
+/// is asked to follow instructions and call tools, not to be creative, and the
+/// knobs a roleplay preset carries (penalties, stop strings, thinking budgets)
+/// are exactly the ones that break tool calling on one host or another.
+class AgentParams {
+  const AgentParams({
+    this.temperature,
+    this.maxTokens,
+    this.stream = true,
+    this.toolsOff = false,
+    this.generation,
+    this.requireToolCompletion = false,
+  });
+
+  final double? temperature;
+  final GenParams? generation;
+  final bool requireToolCompletion;
+
+  /// The tools are declared but may not be called this turn (`tool_choice`
+  /// "none", or Gemini's function-calling mode `NONE`). How a turn asks for
+  /// words only while the history still holds tool calls: declaring the
+  /// tools keeps that history valid on every dialect, which leaving them out
+  /// does not promise.
+  final bool toolsOff;
+
+  /// The reply's ceiling. Anthropic requires one, so it falls back to
+  /// [kAgentDefaultMaxTokens] there when unset.
+  final int? maxTokens;
+  final bool stream;
+}
+
+/// What Anthropic is sent when no ceiling was set. Big enough for a model to
+/// write a whole description into a tool call in one go.
+const int kAgentDefaultMaxTokens = 8192;
+
+/// One piece of an agent turn as it arrives.
+///
+/// Text and thinking stream in as they are written. Tool calls do not: a call
+/// is only yielded once its arguments are complete, so a consumer never sees
+/// half a JSON object.
+class AgentDelta {
+  const AgentDelta({
+    this.text = '',
+    this.reasoning = '',
+    this.toolCalls = const <ToolCall>[],
+    this.usage,
+    this.providerData = const <String, dynamic>{},
+  });
+
+  final String text;
+  final String reasoning;
+  final List<ToolCall> toolCalls;
+  final TokenUsage? usage;
+  final Map<String, dynamic> providerData;
+
+  bool get isEmpty =>
+      text.isEmpty &&
+      reasoning.isEmpty &&
+      toolCalls.isEmpty &&
+      usage == null &&
+      providerData.isEmpty;
+}
+
+/// One agent request, fully assembled but not sent: what [AgentClient.stream]
+/// would POST for it. The Studio's context inspector reads it, and the run
+/// builds its request through the same object, so the two cannot disagree.
+class AgentWireRequest {
+  const AgentWireRequest({
+    required this.provider,
+    required this.messages,
+    required this.tools,
+    required this.params,
+  });
+
+  /// The provider, its model already chosen (the key is not: rotation happens
+  /// when a request is actually made).
+  final Provider provider;
+
+  /// The messages as they go out — pictures resolved to base64.
+  final List<AgentMessage> messages;
+  final List<ToolSpec> tools;
+  final AgentParams params;
+
+  Uri get uri => ChatClient.requestUri(provider, stream: params.stream);
+
+  /// The exact request body.
+  Map<String, dynamic> get body =>
+      AgentClient.body(provider, messages, tools, params);
+
+  /// The request as text, for reading and copying: the URL, the headers with
+  /// every credential redacted, and the body with picture data elided — the
+  /// same rules as the chat's "copy raw request".
+  String preview() {
+    final headers = ChatClient.requestHeaders(provider, stream: params.stream)
+      ..updateAll(
+        (key, value) => ChatClient.isSecretHeader(key) ? '<redacted>' : value,
+      );
+    final shown = [
+      for (final m in messages)
+        m.images.isEmpty
+            ? m
+            : m.withImages([for (final i in m.images) i.elided()]),
+    ];
+    final text = const JsonEncoder.withIndent(
+      '  ',
+    ).convert(AgentClient.body(provider, shown, tools, params));
+    return 'POST $uri\n'
+        '${headers.entries.map((e) => '${e.key}: ${e.value}').join('\n')}\n\n'
+        '$text';
+  }
+}
+
+/// Talks tool-calling to a provider, in whichever of the four dialects it
+/// speaks.
+///
+/// Kept apart from [ChatClient.streamChat] so the roleplay send path — and the
+/// one-`system`-message rule the gateways need there — is untouched by any of
+/// this. It borrows the same URLs, headers and failure wording, so a Studio
+/// error reads exactly like a chat error.
+///
+/// One instance holds one live request, like [ChatClient]; the Studio gives
+/// every agent (and every sub-agent) its own, so they can run side by side.
+class AgentClient {
+  AgentClient({http.Client Function()? clientFactory})
+    : _clientFactory = clientFactory ?? http.Client.new;
+
+  final http.Client Function() _clientFactory;
+  http.Client? _active;
+
+  /// Aborts the in-flight request, if any.
+  void cancel() {
+    _active?.close();
+    _active = null;
+  }
+
+  /// Streams one assistant turn for [messages], offering [tools].
+  Stream<AgentDelta> stream({
+    required Provider provider,
+    required List<AgentMessage> messages,
+    List<ToolSpec> tools = const <ToolSpec>[],
+    AgentParams params = const AgentParams(),
+  }) async* {
+    if (provider.model.trim().isEmpty) {
+      throw ChatApiException('Pick a model for the Studio first.');
+    }
+    final uri = ChatClient.requestUri(provider, stream: params.stream);
+    final client = _clientFactory();
+    _active = client;
+    try {
+      final request = http.Request('POST', uri)
+        ..headers.addAll(
+          ChatClient.requestHeaders(provider, stream: params.stream),
+        )
+        ..body = jsonEncode(body(provider, messages, tools, params));
+      final response = await client.send(request);
+      if (response.statusCode != 200) {
+        final text = await response.stream.bytesToString();
+        throw ChatApiException(
+          ChatClient.describeFailure(response.statusCode, text),
+        );
+      }
+      if (!params.stream) {
+        final raw = await response.stream.bytesToString();
+        final whole = parseWhole(provider.wire, raw);
+        if (params.requireToolCompletion &&
+            !_wholeCompleted(provider.wire, jsonDecode(raw) as Map)) {
+          throw ChatApiException(
+            'The model response ended before its tool calls completed. No action was run.',
+          );
+        }
+        if (!whole.isEmpty) yield whole;
+        return;
+      }
+      final reader = _StreamReader(provider.wire);
+      final lines = response.stream
+          .transform(utf8.decoder)
+          .transform(const LineSplitter());
+      await for (final line in lines) {
+        if (!line.startsWith('data:')) continue;
+        final payload = line.substring(5).trim();
+        if (payload.isEmpty) continue;
+        if (payload == '[DONE]') break;
+        final delta = reader.read(payload);
+        if (delta != null && !delta.isEmpty) yield delta;
+        if (reader.done) break;
+      }
+      final tail = reader.finish();
+      if (params.requireToolCompletion && !reader.successful) {
+        throw ChatApiException(
+          'The model response ended before its tool calls completed. No action was run.',
+        );
+      }
+      if (!tail.isEmpty) yield tail;
+    } on ChatApiException {
+      rethrow;
+    } catch (e) {
+      throw ChatApiException(ChatClient.describeTransport(e));
+    } finally {
+      client.close();
+      if (_active == client) _active = null;
+    }
+  }
+
+  // --- request --------------------------------------------------------------
+
+  /// The request body for [provider]'s dialect. Public so tests can pin the
+  /// exact shape of each one.
+  static Map<String, dynamic> body(
+    Provider provider,
+    List<AgentMessage> messages,
+    List<ToolSpec> tools,
+    AgentParams params,
+  ) {
+    final result = _toolBody(provider, messages, tools, params);
+    if (params.generation != null) {
+      result.addAll(ChatClient.generationFields(provider, params.generation!));
+    }
+    return result;
+  }
+
+  static bool _wholeCompleted(WireFormat wire, Map json) {
+    final choices = json['choices'];
+    final candidates = json['candidates'];
+    return switch (wire) {
+      WireFormat.openaiChat =>
+        choices is List &&
+            choices.isNotEmpty &&
+            [
+              'stop',
+              'tool_calls',
+              'function_call',
+            ].contains((choices.first as Map)['finish_reason']),
+      WireFormat.openaiResponses => json['status'] == 'completed',
+      WireFormat.anthropic => [
+        'end_turn',
+        'tool_use',
+        'stop_sequence',
+      ].contains(json['stop_reason']),
+      WireFormat.gemini =>
+        candidates is List &&
+            candidates.isNotEmpty &&
+            (candidates.first as Map)['finishReason'] == 'STOP',
+    };
+  }
+
+  static Map<String, dynamic> _toolBody(
+    Provider provider,
+    List<AgentMessage> messages,
+    List<ToolSpec> tools,
+    AgentParams params,
+  ) {
+    final model = provider.model.trim();
+    final system = messages
+        .where((m) => m.role == AgentRole.system)
+        .map((m) => m.text)
+        .join('\n\n')
+        .trim();
+    final turns = messages
+        .where((m) => m.role != AgentRole.system)
+        .toList(growable: false);
+    switch (provider.wire) {
+      case WireFormat.openaiChat:
+        return {
+          'model': model,
+          'stream': params.stream,
+          if (params.stream && provider.kind.usageReporting)
+            'stream_options': <String, dynamic>{'include_usage': true},
+          'messages': [
+            if (system.isNotEmpty) {'role': 'system', 'content': system},
+            for (final m in turns) _openAiChatTurn(m),
+          ],
+          if (tools.isNotEmpty)
+            'tools': [
+              for (final t in tools)
+                {
+                  'type': 'function',
+                  'function': {
+                    'name': t.name,
+                    'description': t.description,
+                    'parameters': t.parameters,
+                  },
+                },
+            ],
+          if (tools.isNotEmpty && params.toolsOff) 'tool_choice': 'none',
+          if (params.temperature != null) 'temperature': params.temperature,
+          if ((params.maxTokens ?? 0) > 0) 'max_tokens': params.maxTokens,
+        };
+      case WireFormat.openaiResponses:
+        return {
+          'model': model,
+          'stream': params.stream,
+          if (system.isNotEmpty) 'instructions': system,
+          'input': [for (final m in turns) ..._responsesItems(m)],
+          if (tools.isNotEmpty)
+            'tools': [
+              for (final t in tools)
+                {
+                  'type': 'function',
+                  'name': t.name,
+                  'description': t.description,
+                  'parameters': t.parameters,
+                },
+            ],
+          if (tools.isNotEmpty && params.toolsOff) 'tool_choice': 'none',
+          if (params.temperature != null) 'temperature': params.temperature,
+          if ((params.maxTokens ?? 0) > 0)
+            'max_output_tokens': params.maxTokens,
+        };
+      case WireFormat.anthropic:
+        return {
+          'model': model,
+          'max_tokens': (params.maxTokens ?? 0) > 0
+              ? params.maxTokens
+              : kAgentDefaultMaxTokens,
+          'stream': params.stream,
+          if (system.isNotEmpty) 'system': system,
+          'messages': _anthropicTurns(turns),
+          if (tools.isNotEmpty)
+            'tools': [
+              for (final t in tools)
+                {
+                  'name': t.name,
+                  'description': t.description,
+                  'input_schema': t.parameters,
+                },
+            ],
+          if (tools.isNotEmpty && params.toolsOff)
+            'tool_choice': <String, dynamic>{'type': 'none'},
+          if (params.temperature != null)
+            'temperature': params.temperature!.clamp(0.0, 1.0),
+        };
+      case WireFormat.gemini:
+        final gen = <String, dynamic>{
+          if (params.temperature != null) 'temperature': params.temperature,
+          if ((params.maxTokens ?? 0) > 0) 'maxOutputTokens': params.maxTokens,
+        };
+        return {
+          'contents': _geminiContents(turns),
+          if (system.isNotEmpty)
+            'systemInstruction': {
+              'parts': [
+                {'text': system},
+              ],
+            },
+          if (tools.isNotEmpty)
+            'tools': [
+              {
+                'functionDeclarations': [
+                  for (final t in tools)
+                    {
+                      'name': t.name,
+                      'description': t.description,
+                      if (!t.takesNothing)
+                        'parameters': _geminiSchema(t.parameters),
+                    },
+                ],
+              },
+            ],
+          if (tools.isNotEmpty && params.toolsOff)
+            'toolConfig': {
+              'functionCallingConfig': {'mode': 'NONE'},
+            },
+          if (gen.isNotEmpty) 'generationConfig': gen,
+        };
+    }
+  }
+
+  static Map<String, dynamic> _openAiChatTurn(AgentMessage m) {
+    switch (m.role) {
+      case AgentRole.tool:
+        return {
+          'role': 'tool',
+          'tool_call_id': m.toolCallId,
+          'content': m.text,
+        };
+      case AgentRole.assistant:
+        return {
+          'role': 'assistant',
+          // A turn that only calls tools has no content; OpenAI wants null
+          // there, and several gateways reject an empty string beside calls.
+          'content': m.text.isEmpty && m.toolCalls.isNotEmpty ? null : m.text,
+          if (m.providerData.containsKey('reasoning_content'))
+            'reasoning_content': m.providerData['reasoning_content'],
+          if (m.toolCalls.isNotEmpty)
+            'tool_calls': [
+              for (final c in m.toolCalls)
+                {
+                  'id': c.id,
+                  'type': 'function',
+                  'function': {
+                    'name': c.name,
+                    'arguments': jsonEncode(c.arguments),
+                  },
+                },
+            ],
+        };
+      case AgentRole.user:
+      case AgentRole.system:
+        final pictures = [
+          for (final i in m.images)
+            if (_url(i) != null)
+              {
+                'type': 'image_url',
+                'image_url': <String, dynamic>{'url': _url(i)},
+              },
+        ];
+        return {
+          'role': 'user',
+          'content': pictures.isEmpty
+              ? m.text
+              : [
+                  if (m.text.isNotEmpty) {'type': 'text', 'text': m.text},
+                  ...pictures,
+                ],
+        };
+    }
+  }
+
+  static Map<String, dynamic> _geminiSchema(Map<String, dynamic> schema) => {
+    for (final entry in schema.entries)
+      if ([
+        'type',
+        'description',
+        'enum',
+        'required',
+        'items',
+        'properties',
+        'minimum',
+        'maximum',
+      ].contains(entry.key))
+        entry.key: entry.key == 'properties' && entry.value is Map
+            ? {
+                for (final property in (entry.value as Map).entries)
+                  property.key: _geminiSchema(
+                    Map<String, dynamic>.from(property.value as Map),
+                  ),
+              }
+            : entry.key == 'items' && entry.value is Map
+            ? _geminiSchema(Map<String, dynamic>.from(entry.value as Map))
+            : entry.value,
+  };
+
+  /// What an OpenAI-shaped image part carries: the picture's own address when
+  /// it lives online, a data URL when its bytes were resolved for the wire, and
+  /// null when neither (a picture whose file has gone is dropped, not sent
+  /// empty).
+  static String? _url(MessageImage image) {
+    if (image.isUrl) return image.ref.trim();
+    if (!image.hasData) return null;
+    return 'data:${image.mime};base64,${image.data}';
+  }
+
+  static List<Map<String, dynamic>> _responsesItems(AgentMessage m) {
+    switch (m.role) {
+      case AgentRole.tool:
+        return [
+          {
+            'type': 'function_call_output',
+            'call_id': m.toolCallId,
+            'output': m.text,
+          },
+        ];
+      case AgentRole.assistant:
+        if (m.providerData['responses'] is List) {
+          return (m.providerData['responses'] as List)
+              .whereType<Map>()
+              .map((v) => Map<String, dynamic>.from(v))
+              .toList();
+        }
+        return [
+          if (m.text.isNotEmpty)
+            {
+              'role': 'assistant',
+              'content': [
+                {'type': 'output_text', 'text': m.text},
+              ],
+            },
+          // Sent without the item `id` the host gave it: an id makes the API
+          // insist on the matching reasoning item too, which is not kept.
+          for (final c in m.toolCalls)
+            {
+              'type': 'function_call',
+              'call_id': c.id,
+              'name': c.name,
+              'arguments': jsonEncode(c.arguments),
+            },
+        ];
+      case AgentRole.user:
+      case AgentRole.system:
+        return [
+          {
+            'role': 'user',
+            'content': [
+              {'type': 'input_text', 'text': m.text},
+              for (final i in m.images)
+                if (_url(i) != null)
+                  {'type': 'input_image', 'image_url': _url(i)},
+            ],
+          },
+        ];
+    }
+  }
+
+  /// Anthropic's turns. Every tool result for one assistant turn has to arrive
+  /// in the single user turn that follows it, and first in it; a user message
+  /// typed after them joins that same turn as a text block.
+  static List<Map<String, dynamic>> _anthropicTurns(List<AgentMessage> turns) {
+    final out = <Map<String, dynamic>>[];
+    List<Map<String, dynamic>>? userBlocks;
+    void flushUser() {
+      if (userBlocks != null && userBlocks!.isNotEmpty) {
+        out.add({'role': 'user', 'content': userBlocks});
+      }
+      userBlocks = null;
+    }
+
+    for (final m in turns) {
+      switch (m.role) {
+        case AgentRole.assistant:
+          flushUser();
+          out.add({
+            'role': 'assistant',
+            'content':
+                m.providerData['anthropic'] ??
+                [
+                  if (m.text.isNotEmpty) {'type': 'text', 'text': m.text},
+                  for (final c in m.toolCalls)
+                    {
+                      'type': 'tool_use',
+                      'id': c.id,
+                      'name': c.name,
+                      'input': c.arguments,
+                    },
+                ],
+          });
+        case AgentRole.tool:
+          (userBlocks ??= <Map<String, dynamic>>[]).add({
+            'type': 'tool_result',
+            'tool_use_id': m.toolCallId,
+            'content': m.text,
+            if (m.isError) 'is_error': true,
+          });
+        case AgentRole.user:
+        case AgentRole.system:
+          final blocks = userBlocks ??= <Map<String, dynamic>>[];
+          // Pictures first, the way Anthropic's own guidance orders them.
+          for (final i in m.images) {
+            if (i.isUrl) {
+              blocks.add({
+                'type': 'image',
+                'source': {'type': 'url', 'url': i.ref.trim()},
+              });
+            } else if (i.hasData) {
+              blocks.add({
+                'type': 'image',
+                'source': {
+                  'type': 'base64',
+                  'media_type': i.mime,
+                  'data': i.data,
+                },
+              });
+            }
+          }
+          if (m.text.isNotEmpty || m.images.isEmpty) {
+            blocks.add({'type': 'text', 'text': m.text});
+          }
+      }
+    }
+    flushUser();
+    return out;
+  }
+
+  /// Gemini's contents. Results go back as `functionResponse` parts in one user
+  /// turn, matched by name (and by id when the model gave one), and each call is
+  /// echoed with its `thoughtSignature`.
+  static List<Map<String, dynamic>> _geminiContents(List<AgentMessage> turns) {
+    final out = <Map<String, dynamic>>[];
+    List<Map<String, dynamic>>? userParts;
+    // Which calls had a real id, so a made-up one is never sent back.
+    final synthetic = <String>{};
+    void flushUser() {
+      if (userParts != null && userParts!.isNotEmpty) {
+        out.add({'role': 'user', 'parts': userParts});
+      }
+      userParts = null;
+    }
+
+    for (final m in turns) {
+      switch (m.role) {
+        case AgentRole.assistant:
+          flushUser();
+          final parts = <Map<String, dynamic>>[
+            if (m.text.isNotEmpty) {'text': m.text},
+            for (final c in m.toolCalls)
+              {
+                'functionCall': {
+                  'name': c.name,
+                  'args': c.arguments,
+                  if (!c.syntheticId) 'id': c.id,
+                },
+                if (c.signature != null) 'thoughtSignature': c.signature,
+              },
+          ];
+          for (final c in m.toolCalls) {
+            if (c.syntheticId) synthetic.add(c.id);
+          }
+          // Gemini refuses a turn with no parts at all.
+          if (parts.isEmpty) parts.add({'text': ''});
+          out.add({'role': 'model', 'parts': parts});
+        case AgentRole.tool:
+          (userParts ??= <Map<String, dynamic>>[]).add({
+            'functionResponse': {
+              'name': m.toolName,
+              if (m.toolCallId != null && !synthetic.contains(m.toolCallId))
+                'id': m.toolCallId,
+              // The response has to be an object; the text rides inside it.
+              'response': m.isError ? {'error': m.text} : {'result': m.text},
+            },
+          });
+        case AgentRole.user:
+        case AgentRole.system:
+          final parts = userParts ??= <Map<String, dynamic>>[];
+          parts.add({'text': m.text});
+          // Gemini has no URL form for an inline picture; one that only lives
+          // online is left out rather than sent as something it rejects.
+          for (final i in m.images) {
+            if (!i.isUrl && i.hasData) {
+              parts.add({
+                'inlineData': <String, dynamic>{
+                  'mimeType': i.mime,
+                  'data': i.data,
+                },
+              });
+            }
+          }
+      }
+    }
+    flushUser();
+    return out;
+  }
+
+  // --- whole (non-streamed) replies ------------------------------------------
+
+  /// A whole reply body read into one delta, by dialect.
+  static AgentDelta parseWhole(WireFormat wire, String body) {
+    final Object? json;
+    try {
+      json = jsonDecode(body);
+    } catch (_) {
+      throw ChatApiException('The host sent a malformed response.');
+    }
+    if (json is! Map<String, dynamic>) {
+      throw ChatApiException('The host sent an unexpected response shape.');
+    }
+    if (json['error'] != null) {
+      throw ChatApiException(ChatClient.describeErrorBody(json));
+    }
+    switch (wire) {
+      case WireFormat.openaiChat:
+        final choices = json['choices'];
+        final usage = ChatClient.openAiUsage(json['usage']);
+        if (choices is! List || choices.isEmpty) {
+          return AgentDelta(usage: usage);
+        }
+        final message = choices.first is Map ? choices.first['message'] : null;
+        if (message is! Map) return AgentDelta(usage: usage);
+        final calls = <ToolCall>[];
+        final raw = message['tool_calls'];
+        if (raw is List) {
+          for (final c in raw) {
+            if (c is! Map) continue;
+            final fn = c['function'];
+            if (fn is! Map) continue;
+            final args = fn['arguments'];
+            calls.add(
+              _call(
+                id: c['id'] as String?,
+                name: fn['name'] as String? ?? '',
+                rawArguments: args is String ? args : jsonEncode(args ?? {}),
+                fallbackIndex: calls.length,
+              ),
+            );
+          }
+        }
+        final reasoning = message['reasoning_content'] ?? message['reasoning'];
+        return AgentDelta(
+          text: message['content'] is String
+              ? message['content'] as String
+              : '',
+          reasoning: reasoning is String ? reasoning : '',
+          toolCalls: calls,
+          usage: usage,
+          providerData: reasoning is String
+              ? {'reasoning_content': reasoning}
+              : const {},
+        );
+      case WireFormat.openaiResponses:
+        final text = StringBuffer();
+        final thoughts = StringBuffer();
+        final calls = <ToolCall>[];
+        final output = json['output'];
+        if (output is List) {
+          for (final item in output) {
+            if (item is! Map) continue;
+            if (item['type'] == 'function_call') {
+              calls.add(_responsesCall(item, calls.length));
+              continue;
+            }
+            final content = item['content'] ?? item['summary'];
+            if (content is! List) continue;
+            for (final part in content) {
+              if (part is Map && part['text'] is String) {
+                (item['type'] == 'reasoning' ? thoughts : text).write(
+                  part['text'] as String,
+                );
+              }
+            }
+          }
+        }
+        return AgentDelta(
+          text: text.toString(),
+          reasoning: thoughts.toString(),
+          toolCalls: calls,
+          usage: ChatClient.openAiUsage(json['usage']),
+          providerData: {'responses': output ?? []},
+        );
+      case WireFormat.anthropic:
+        final text = StringBuffer();
+        final thoughts = StringBuffer();
+        final calls = <ToolCall>[];
+        final blocks = json['content'];
+        if (blocks is List) {
+          for (final b in blocks) {
+            if (b is! Map) continue;
+            switch (b['type']) {
+              case 'text':
+                text.write(b['text'] as String? ?? '');
+              case 'thinking':
+                thoughts.write(b['thinking'] as String? ?? '');
+              case 'tool_use':
+                calls.add(
+                  ToolCall(
+                    id: b['id'] as String? ?? 'call_${calls.length}',
+                    name: b['name'] as String? ?? '',
+                    arguments: b['input'] is Map
+                        ? Map<String, dynamic>.from(b['input'] as Map)
+                        : const <String, dynamic>{},
+                  ),
+                );
+            }
+          }
+        }
+        return AgentDelta(
+          text: text.toString(),
+          reasoning: thoughts.toString(),
+          toolCalls: calls,
+          usage: ChatClient.openAiUsage(json['usage']),
+          providerData: {'anthropic': blocks ?? []},
+        );
+      case WireFormat.gemini:
+        final reader = _StreamReader(WireFormat.gemini);
+        final head = reader.readGemini(json) ?? const AgentDelta();
+        return AgentDelta(
+          text: head.text,
+          reasoning: head.reasoning,
+          toolCalls: reader.finish().toolCalls,
+          usage: head.usage,
+        );
+    }
+  }
+
+  static ToolCall _responsesCall(Map item, int index) {
+    final args = item['arguments'];
+    return _call(
+      id: (item['call_id'] ?? item['id']) as String?,
+      name: item['name'] as String? ?? '',
+      rawArguments: args is String ? args : jsonEncode(args ?? {}),
+      fallbackIndex: index,
+    );
+  }
+
+  /// A call from a raw argument string, with an id made up when the host sent
+  /// none.
+  static ToolCall _call({
+    required String? id,
+    required String name,
+    required String rawArguments,
+    required int fallbackIndex,
+    String? signature,
+  }) {
+    final parsed = ToolCall.parseArguments(rawArguments);
+    final hasId = id != null && id.trim().isNotEmpty;
+    return ToolCall(
+      id: hasId ? id : 'call_$fallbackIndex',
+      name: name,
+      arguments: parsed.arguments,
+      argumentError: parsed.error,
+      syntheticId: !hasId,
+      signature: signature,
+    );
+  }
+}
+
+/// A tool call whose pieces are still arriving.
+class _PartialCall {
+  _PartialCall({this.id, this.name = ''});
+
+  String? id;
+  String name;
+  final StringBuffer arguments = StringBuffer();
+  Map<String, dynamic>? whole;
+  String? signature;
+}
+
+/// Reads one dialect's SSE events, streaming text and thinking out as they come
+/// and holding tool calls until they are whole.
+class _StreamReader {
+  _StreamReader(this.wire);
+
+  final WireFormat wire;
+
+  /// Whether the dialect has said it is finished.
+  bool done = false;
+  bool successful = false;
+  String? _anthropicStop;
+  final Map<int, Map<String, dynamic>> _anthropicBlocks = {};
+  final Map<int, Map<String, dynamic>> _responsesItems = {};
+  final StringBuffer _chatReasoning = StringBuffer();
+
+  /// Calls in the order they started, keyed by the position the dialect uses to
+  /// address them (OpenAI's `index`, Anthropic's block `index`, Responses'
+  /// output index), or by arrival order for Gemini.
+  final Map<int, _PartialCall> _calls = <int, _PartialCall>{};
+
+  /// OpenAI chat only: which of [_calls] a host's `index` currently points at.
+  /// Not the index itself, because gateways reuse it — one that converts
+  /// Gemini's stream restarts `index` at 0 in every chunk, so parallel calls
+  /// arriving in separate chunks all say 0.
+  final Map<int, int> _byWireIndex = <int, int>{};
+  int _nextKey = 0;
+
+  AgentDelta? read(String payload) {
+    final Object? json;
+    try {
+      json = jsonDecode(payload);
+    } catch (_) {
+      return null;
+    }
+    if (json is! Map<String, dynamic>) return null;
+    switch (wire) {
+      case WireFormat.openaiChat:
+        return _openAiChat(json);
+      case WireFormat.openaiResponses:
+        return _responses(json);
+      case WireFormat.anthropic:
+        return _anthropic(json);
+      case WireFormat.gemini:
+        return readGemini(json);
+    }
+  }
+
+  /// The tool calls that were held back, as the turn's last delta.
+  AgentDelta finish() {
+    final keys = _calls.keys.toList()..sort();
+    final calls = <ToolCall>[];
+    for (final k in keys) {
+      final p = _calls[k]!;
+      if (p.name.isEmpty) continue;
+      if (p.whole != null) {
+        final hasId = p.id != null && p.id!.isNotEmpty;
+        calls.add(
+          ToolCall(
+            id: hasId ? p.id! : 'call_${calls.length}',
+            name: p.name,
+            arguments: p.whole!,
+            syntheticId: !hasId,
+            signature: p.signature,
+          ),
+        );
+      } else {
+        calls.add(
+          AgentClient._call(
+            id: p.id,
+            name: p.name,
+            rawArguments: p.arguments.toString(),
+            fallbackIndex: calls.length,
+            signature: p.signature,
+          ),
+        );
+      }
+    }
+    _calls.clear();
+    final blocks = <Map<String, dynamic>>[];
+    for (final index in _anthropicBlocks.keys.toList()..sort()) {
+      final block = Map<String, dynamic>.from(_anthropicBlocks[index]!);
+      if (block['type'] == 'tool_use') {
+        for (final call in calls) {
+          if (call.id == block['id']) block['input'] = call.arguments;
+        }
+      }
+      blocks.add(block);
+    }
+    return AgentDelta(
+      toolCalls: calls,
+      providerData: {
+        if (blocks.isNotEmpty) 'anthropic': blocks,
+        if (_responsesItems.isNotEmpty)
+          'responses': [
+            for (final index in _responsesItems.keys.toList()..sort())
+              _responsesItems[index],
+          ],
+        if (_chatReasoning.isNotEmpty)
+          'reasoning_content': _chatReasoning.toString(),
+      },
+    );
+  }
+
+  static Never _fail(Map<String, dynamic> json) =>
+      throw ChatApiException(ChatClient.describeErrorBody(json));
+
+  AgentDelta? _openAiChat(Map<String, dynamic> json) {
+    if (json['error'] != null) _fail(json);
+    final usage = ChatClient.openAiUsage(json['usage']);
+    final choices = json['choices'];
+    if (choices is! List || choices.isEmpty) {
+      return usage == null ? null : AgentDelta(usage: usage);
+    }
+    final choice = choices.first;
+    if (choice is! Map) return null;
+    final finish = choice['finish_reason'];
+    if (finish != null) {
+      successful = ['stop', 'tool_calls', 'function_call'].contains(finish);
+    }
+    final delta = choice['delta'] ?? choice['message'];
+    if (delta is! Map) return usage == null ? null : AgentDelta(usage: usage);
+    final raw = delta['tool_calls'];
+    final reasoningContent = delta['reasoning_content'];
+    if (reasoningContent is String) _chatReasoning.write(reasoningContent);
+    if (raw is List) {
+      for (final entry in raw) {
+        if (entry is! Map) continue;
+        final id = entry['id'] as String?;
+        final fn = entry['function'];
+        final name = fn is Map ? fn['name'] as String? : null;
+        final wireIndex = (entry['index'] as num?)?.toInt();
+        // Most hosts address a call's pieces by `index`, with the id and name
+        // on the first piece only. So a piece is a *new* call when it has no
+        // call to join yet, or when it brings an id (or a name) other than the
+        // one its index already holds — that is a host reusing the index.
+        final currentKey = wireIndex == null
+            ? (_calls.isEmpty ? null : _calls.keys.last)
+            : _byWireIndex[wireIndex];
+        final current = currentKey == null ? null : _calls[currentKey];
+        final args = fn is Map ? fn['arguments'] : null;
+        final startsNew =
+            current == null ||
+            (id != null &&
+                id.isNotEmpty &&
+                current.id != null &&
+                current.id != id) ||
+            (name != null &&
+                name.isNotEmpty &&
+                current.name.isNotEmpty &&
+                current.name != name) ||
+            // No id and the same tool: a fresh object opening after the
+            // current one is already whole is a second call, not more of it.
+            (args is String &&
+                args.trimLeft().startsWith('{') &&
+                _isWholeObject(current.arguments.toString()));
+        final int index;
+        if (startsNew) {
+          index = _nextKey++;
+          if (wireIndex != null) _byWireIndex[wireIndex] = index;
+        } else {
+          index = currentKey!;
+        }
+        final partial = _calls.putIfAbsent(index, _PartialCall.new);
+        if (id != null && id.isNotEmpty) partial.id = id;
+        if (fn is Map) {
+          if (name != null && name.isNotEmpty) partial.name = name;
+          if (args is String) {
+            partial.arguments.write(args);
+          } else if (args is Map) {
+            partial.whole = Map<String, dynamic>.from(args);
+          }
+        }
+      }
+    }
+    final reasoning = delta['reasoning_content'] ?? delta['reasoning'];
+    return AgentDelta(
+      text: delta['content'] is String ? delta['content'] as String : '',
+      reasoning: reasoning is String ? reasoning : '',
+      usage: usage,
+    );
+  }
+
+  static bool _isWholeObject(String text) {
+    final t = text.trim();
+    if (t.isEmpty || !t.startsWith('{') || !t.endsWith('}')) return false;
+    try {
+      return jsonDecode(t) is Map;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  AgentDelta? _responses(Map<String, dynamic> json) {
+    final type = json['type'];
+    if (type == 'error' || type == 'response.failed') _fail(json);
+    switch (type) {
+      case 'response.output_text.delta':
+        return json['delta'] is String
+            ? AgentDelta(text: json['delta'] as String)
+            : null;
+      case 'response.reasoning_summary_text.delta':
+      case 'response.reasoning_text.delta':
+        return json['delta'] is String
+            ? AgentDelta(reasoning: json['delta'] as String)
+            : null;
+      case 'response.output_item.added':
+      case 'response.output_item.done':
+        final item = json['item'];
+        if (type == 'response.output_item.done' && item is Map) {
+          _responsesItems[(json['output_index'] as num?)?.toInt() ??
+              _responsesItems.length] = Map<String, dynamic>.from(
+            item,
+          );
+        }
+        if (item is Map && item['type'] == 'function_call') {
+          final index =
+              (json['output_index'] as num?)?.toInt() ?? _calls.length;
+          final partial = _calls.putIfAbsent(index, _PartialCall.new);
+          partial.id = (item['call_id'] ?? item['id']) as String? ?? partial.id;
+          partial.name = item['name'] as String? ?? partial.name;
+          final args = item['arguments'];
+          // `.done` carries the finished arguments; they replace the pieces.
+          if (type == 'response.output_item.done' && args is String) {
+            partial.arguments
+              ..clear()
+              ..write(args);
+          }
+        }
+        return null;
+      case 'response.function_call_arguments.delta':
+        final index = (json['output_index'] as num?)?.toInt();
+        final partial = index == null ? null : _calls[index];
+        if (partial != null && json['delta'] is String) {
+          partial.arguments.write(json['delta'] as String);
+        }
+        return null;
+      case 'response.completed':
+      case 'response.incomplete':
+        successful = type == 'response.completed';
+        done = true;
+        final response = json['response'];
+        return response is Map
+            ? AgentDelta(usage: ChatClient.openAiUsage(response['usage']))
+            : null;
+    }
+    return null;
+  }
+
+  AgentDelta? _anthropic(Map<String, dynamic> json) {
+    final type = json['type'];
+    if (type == 'error') _fail(json);
+    switch (type) {
+      case 'message_start':
+        final message = json['message'];
+        final usage = message is Map
+            ? ChatClient.openAiUsage(message['usage'])
+            : null;
+        return usage == null ? null : AgentDelta(usage: usage);
+      case 'content_block_start':
+        final block = json['content_block'];
+        final index = (json['index'] as num?)?.toInt() ?? _calls.length;
+        if (block is Map) {
+          _anthropicBlocks[index] = Map<String, dynamic>.from(block);
+        }
+        if (block is Map && block['type'] == 'tool_use') {
+          _calls[index] = _PartialCall(
+            id: block['id'] as String?,
+            name: block['name'] as String? ?? '',
+          );
+        }
+        return null;
+      case 'content_block_delta':
+        final delta = json['delta'];
+        if (delta is! Map) return null;
+        final block = _anthropicBlocks[(json['index'] as num?)?.toInt()];
+        if (block != null) {
+          for (final key in ['text', 'thinking', 'signature']) {
+            if (delta[key] is String) {
+              block[key] = '${block[key] ?? ''}${delta[key]}';
+            }
+          }
+        }
+        switch (delta['type']) {
+          case 'text_delta':
+            return AgentDelta(text: delta['text'] as String? ?? '');
+          case 'thinking_delta':
+            return AgentDelta(reasoning: delta['thinking'] as String? ?? '');
+          case 'input_json_delta':
+            final index = (json['index'] as num?)?.toInt();
+            final partial = index == null ? null : _calls[index];
+            partial?.arguments.write(delta['partial_json'] as String? ?? '');
+        }
+        return null;
+      case 'message_delta':
+        final d = json['delta'];
+        if (d is Map && d['stop_reason'] is String) {
+          _anthropicStop = d['stop_reason'] as String;
+        }
+        final usage = ChatClient.openAiUsage(json['usage']);
+        return usage == null ? null : AgentDelta(usage: usage);
+      case 'message_stop':
+        done = true;
+        successful = [
+          'end_turn',
+          'tool_use',
+          'stop_sequence',
+        ].contains(_anthropicStop);
+        return null;
+    }
+    return null;
+  }
+
+  /// One Gemini chunk. A call arrives whole inside one part, with the
+  /// signature beside it on that same part.
+  AgentDelta? readGemini(Map<String, dynamic> json) {
+    if (json['error'] != null) _fail(json);
+    final usage = ChatClient.geminiUsage(json['usageMetadata']);
+    final candidates = json['candidates'];
+    if (candidates is! List || candidates.isEmpty) {
+      return usage == null ? null : AgentDelta(usage: usage);
+    }
+    final content = candidates.first is Map
+        ? candidates.first['content']
+        : null;
+    if (candidates.first is Map && candidates.first['finishReason'] != null) {
+      successful = candidates.first['finishReason'] == 'STOP';
+    }
+    final parts = content is Map ? content['parts'] : null;
+    final text = StringBuffer();
+    final thoughts = StringBuffer();
+    if (parts is List) {
+      for (final part in parts) {
+        if (part is! Map) continue;
+        final call = part['functionCall'];
+        if (call is Map) {
+          _calls[_calls.length] =
+              _PartialCall(
+                  id: call['id'] as String?,
+                  name: call['name'] as String? ?? '',
+                )
+                ..whole = call['args'] is Map
+                    ? Map<String, dynamic>.from(call['args'] as Map)
+                    : <String, dynamic>{}
+                ..signature = part['thoughtSignature'] as String?;
+          continue;
+        }
+        if (part['text'] is String) {
+          (part['thought'] == true ? thoughts : text).write(
+            part['text'] as String,
+          );
+        }
+      }
+    }
+    return AgentDelta(
+      text: text.toString(),
+      reasoning: thoughts.toString(),
+      usage: usage,
+    );
+  }
+}

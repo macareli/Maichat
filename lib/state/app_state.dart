@@ -9,6 +9,7 @@ import 'package:flutter/scheduler.dart';
 import '../app_info.dart';
 import '../models/appearance.dart';
 import '../models/backup.dart';
+import '../models/btw_conversation.dart';
 import '../models/budget.dart';
 import '../models/character.dart';
 import '../models/character_scenario.dart';
@@ -19,8 +20,11 @@ import '../models/embedding.dart';
 import '../models/floating_image.dart';
 import '../models/folder.dart';
 import '../models/gallery_image.dart';
+import '../models/home_layout.dart';
+import '../models/home_note.dart';
 import '../models/image_gen.dart';
 import '../models/interface_preset.dart';
+import '../models/agent_message.dart';
 import '../models/lorebook.dart';
 import '../models/message.dart';
 import '../models/message_image.dart';
@@ -29,9 +33,13 @@ import '../models/prompt_block.dart';
 import '../models/provider.dart';
 import '../models/regex_rule.dart';
 import '../models/scenario.dart';
+import '../models/settings.dart';
+import '../models/studio.dart';
 import '../models/summary.dart';
 import '../models/usage.dart';
 import '../models/view_prefs.dart';
+import '../services/agent_client.dart';
+import '../services/btw.dart';
 import '../services/chat_client.dart';
 import '../services/chat_graph.dart';
 import '../services/avatar_store.dart';
@@ -54,14 +62,40 @@ import '../services/reasoning.dart';
 import '../services/regex_engine.dart';
 import '../services/storage.dart';
 import '../services/storage_report.dart';
+import '../services/studio/studio_store.dart';
 import '../services/summarizer.dart';
 import '../services/tokenizer.dart';
 import '../services/update_service.dart';
 import '../services/usage_ledger.dart';
 import '../services/world_info.dart';
+import 'chat_host.dart';
+import '../models/chat_tool.dart';
+import '../services/chat_tools/runtime.dart';
+import '../services/chat_tools/definitions.dart';
+
+export 'chat_host.dart' show ChatHost, ChatPresetHost, kHostedChatPrefix;
+
+part 'chat_tools_state.dart';
+part 'btw_state.dart';
 
 /// Single source of truth for providers, threads and the in-flight reply.
 class AppState extends ChangeNotifier {
+  void _notifyBtw() {
+    if (!_btwDisposed) notifyListeners();
+  }
+
+  void _notifyChatTools({bool stateChanged = true}) {
+    if (stateChanged) _toolProjectionCache.clear();
+    notifyListeners();
+  }
+
+  final Map<String, ({String signature, ChatToolProjection projection})>
+  _toolProjectionCache = {};
+  ChatToolConfig _chatTools = const ChatToolConfig();
+  final Map<String, List<String>> _chatToolRequests = {};
+  AgentClient? _chatToolClient;
+  void Function()? _cancelChatToolRun;
+  final Set<String> _chatToolWriting = {};
   AppState({
     Storage? storage,
     ChatClient? client,
@@ -72,21 +106,32 @@ class AppState extends ChangeNotifier {
     BackupStore? backups,
     DriveClient? drive,
     Summarizer? summarizer,
+    StudioStore? studio,
     this.loadTimeout = const Duration(seconds: 30),
+    this.backgroundWarmUp = false,
   }) : _storage = storage ?? Storage(),
        _client = client ?? ChatClient(),
        _imageClient = imageClient ?? ImageClient(),
+       _chatToolImageClientFactory = (() => imageClient ?? ImageClient()),
        _updateService = updateService ?? UpdateService(),
        _drive = drive ?? DriveClient(),
        _summarizer = summarizer ?? Summarizer() {
     _avatars = avatars;
     _vectors = embeddings;
     _backups = backups;
+    _studio = studio;
   }
+
+  /// Where Character Studio sessions live, when the platform named a folder.
+  /// Read by the picture sweep: a picture a draft or a Studio message refers to
+  /// is kept even when nothing in the library points at it yet.
+  StudioStore? _studio;
 
   final Storage _storage;
   final ChatClient _client;
   final ImageClient _imageClient;
+  final ImageClient Function() _chatToolImageClientFactory;
+  final Set<ImageClient> _chatToolImageClients = {};
   final UpdateService _updateService;
 
   /// How Google Drive is talked to. Injectable so the backup tests can point the
@@ -97,6 +142,15 @@ class AppState extends ChangeNotifier {
   /// enough for a big store on a slow phone, short enough that the app is never
   /// simply stuck.
   final Duration loadTimeout;
+
+  /// Keep launch work off the first frames: build the tokenizer's vocabulary on
+  /// a background isolate, and hold the picture sweep and an owed backup back
+  /// by [_deferredStartupWork]. The app turns this on (see `main.dart`); tests
+  /// leave it off, since an isolate's reply never arrives inside a widget
+  /// test's fake-async zone and a test wants the sweep when `init` returns.
+  final bool backgroundWarmUp;
+
+  static const Duration _deferredStartupWork = Duration(seconds: 4);
 
   /// Where character pictures are kept. Resolved in `main()` before the first
   /// frame and handed in, so nothing here has to wait on a platform channel;
@@ -112,6 +166,15 @@ class AppState extends ChangeNotifier {
   final List<BackupRecord> _backupRecords = <BackupRecord>[];
 
   final List<Conversation> _conversations = <Conversation>[];
+  final List<BtwConversation> _btwThreads = <BtwConversation>[];
+  BtwSettings _btwSettings = const BtwSettings();
+  Future<void> _btwSaves = Future<void>.value();
+  int _btwPendingWrites = 0;
+  final Map<String, BtwRun> _btwTitleRuns = {};
+  final Map<String, BtwRun> _btwRequests = {};
+  bool _btwDisposed = false;
+  bool _btwRestoring = false;
+  int _btwGeneration = 0;
   final List<Provider> _providers = <Provider>[];
   final List<Character> _characters = <Character>[];
   final List<Lorebook> _lorebooks = <Lorebook>[];
@@ -272,10 +335,11 @@ class AppState extends ChangeNotifier {
   /// Writes any debounced state straight away — for tests, backups, and for the
   /// app being backgrounded before a timer fires.
   Future<void> flushPendingSaves() async {
+    if (_btwPendingWrites > 0) await _btwSaves;
     if (_floatPersist?.isActive ?? false) {
       _floatPersist!.cancel();
       _floatPersist = null;
-      if (_writable) await _storage.saveConversations(_conversations);
+      await _saveConversations();
     }
     if (_imageRatioPersist?.isActive ?? false) {
       _imageRatioPersist!.cancel();
@@ -319,8 +383,110 @@ class AppState extends ChangeNotifier {
   /// Whether there is an active provider ready to send.
   bool get isConfigured => activeProvider?.isConfigured ?? false;
 
+  // --- Hosted chats ----------------------------------------------------------
+
+  /// The host whose chat is on screen (the Studio's Playground), or null — see
+  /// [ChatHost]. Only one at a time: the Playground of the session open now.
+  ChatHost? _host;
+
+  /// Which of [_host]'s chats is the active one.
+  String? _hostedId;
+
+  /// The host attached now, if any.
+  ChatHost? get chatHost => _host;
+
+  /// The id of the hosted chat on screen, or null when none is.
+  String? get hostedChatId => _host == null ? null : _hostedId;
+
+  /// Makes [host]'s chat [conversationId] the active chat — what the chat
+  /// screen shows and every send works on — without touching the app's own
+  /// list or the stored active id, so the chat the user left is the one they
+  /// come back to.
+  void hostChats(ChatHost host, String conversationId) {
+    if (identical(_host, host) && _hostedId == conversationId) return;
+    _host = host;
+    _formerHost = host;
+    _hostedId = conversationId;
+    notifyListeners();
+  }
+
+  /// Detaches [host], when it is the one attached: the app's own active chat
+  /// is the active one again. A reply still being written carries on into
+  /// the chat it was asked for, and is kept through [host] when it lands.
+  void leaveHostedChats(ChatHost host) {
+    if (!identical(_host, host)) return;
+    _host = null;
+    _hostedId = null;
+    notifyListeners();
+  }
+
+  /// The host attached last, kept so a reply that lands after its host was
+  /// detached is still saved where its chat lives.
+  ChatHost? _formerHost;
+
+  /// Tells the chat screen that the attached host changed something it shows
+  /// (the draft its chats are with, a turn an agent added).
+  void hostedChatsChanged() {
+    if (_host != null) notifyListeners();
+  }
+
+  Conversation? _hostedChat(ChatHost host, String? id) {
+    if (id == null) return null;
+    for (final c in host.chats) {
+      if (c.id == id) return c;
+    }
+    return null;
+  }
+
+  /// Whether [conversation] is one of the attached host's chats.
+  bool isHostedChat(Conversation? conversation) => _isHosted(conversation);
+
+  bool _isHosted(Conversation? conversation) =>
+      _hostOf(conversation) != null && identical(_hostOf(conversation), _host);
+
+  /// The host [conversation] belongs to — the attached one, or the one
+  /// attached last — or null for one of the app's own.
+  ChatHost? _hostOf(Conversation? conversation) {
+    if (conversation == null) return null;
+    for (final host in [?_host, ?_formerHost]) {
+      for (final c in host.chats) {
+        if (identical(c, conversation)) return host;
+      }
+    }
+    return null;
+  }
+
+  /// Leaves the hosted chat for one of the app's own — whatever opened it
+  /// (a chat list, a character's "chat") means the app's chat now.
+  void _leaveHostForMain() {
+    _host = null;
+    _hostedId = null;
+  }
+
+  /// Persists [conversation]: through its host when it is hosted, otherwise
+  /// the app's list. The per-turn writes go through here, so a Playground
+  /// chat's turn never re-encodes every chat the app holds.
+  Future<void> _saveChat(Conversation conversation) async {
+    final host = _hostOf(conversation);
+    if (host != null) {
+      if (_writable) host.save();
+      return;
+    }
+    await _saveConversations();
+  }
+
   /// The visible thread, creating one on first run.
   Conversation get active {
+    final host = _host;
+    if (host != null) {
+      // While a host is attached the active chat is one of its own — never a
+      // fallback into the app's list, which would mint a stray chat there.
+      final hosted = _hostedChat(host, _hostedId);
+      if (hosted != null) return hosted;
+      final fallback = host.chats.isEmpty ? host.newChat() : host.chats.first;
+      _hostedId = fallback.id;
+      return fallback;
+    }
     final id = _activeId;
     if (id != null) {
       for (final conversation in _conversations) {
@@ -340,6 +506,7 @@ class AppState extends ChangeNotifier {
   /// The visible thread without creating one — for read-only peeks (e.g. before
   /// committing to a send).
   Conversation? _activeOrNull() {
+    if (_host != null) return active;
     final id = _activeId;
     if (id != null) {
       for (final conversation in _conversations) {
@@ -374,8 +541,15 @@ class AppState extends ChangeNotifier {
       // zone. Only schedule real cleanup when there is a store to sweep; a
       // no-store AppState needs no cross-zone task at all.
       if (_avatars != null && _writable) {
+        // On a device the sweep waits for the first screens to settle: it lists
+        // the pictures folder and parses every Studio session to know what to
+        // keep, which is nothing the user is waiting for.
         _startupAvatarSweep = Zone.root.run<Future<void>>(
-          _runStartupAvatarSweep,
+          () => backgroundWarmUp
+              ? Future<void>.delayed(
+                  _deferredStartupWork,
+                ).then((_) => _runStartupAvatarSweep())
+              : _runStartupAvatarSweep(),
         );
         unawaited(_startupAvatarSweep);
       } else {
@@ -385,21 +559,50 @@ class AppState extends ChangeNotifier {
       unawaited(checkForUpdates());
       // The schedule is checked here because there is no background worker: a
       // backup that is owed is taken the next time the app is opened. Returns at
-      // once when nothing is due, which is the normal case.
-      unawaited(runDueBackup());
+      // once when nothing is due, which is the normal case. When one is due it
+      // zips the pictures folder, so on a device it starts once the app is up
+      // rather than racing the first frames for the disk.
+      if (backgroundWarmUp) {
+        unawaited(
+          Zone.root.run(
+            () => Future<void>.delayed(
+              _deferredStartupWork,
+              () => runDueBackup(),
+            ),
+          ),
+        );
+      } else {
+        unawaited(runDueBackup());
+      }
       // Building a BPE vocabulary is ~100k entries of work and the encoder cache
       // is static, so the first caller pays for the whole process. Left on the
       // build path it landed on whichever screen happened to ask first, as a
       // visible hitch. Pay it here instead, in a microtask — off init's await
       // chain, and no timer for a widget test to trip over.
-      scheduleMicrotask(() {
-        try {
-          _tokenizer.estimate('warm');
-        } catch (_) {
-          // The tokenizer already falls back to a heuristic on its own; a failed
-          // warm-up must not take the launch with it.
-        }
-      });
+      //
+      // On a device it is built on a background isolate instead: as a microtask
+      // it ran before Home's first frame and held the startup screen up for
+      // seconds. Widget tests keep the microtask — a real isolate's reply never
+      // arrives inside their fake-async zone.
+      if (!_tokenizer.usesBpe) {
+        // Local tokenizers are off: there is nothing to build.
+      } else if (backgroundWarmUp) {
+        final warm = Stopwatch()..start();
+        unawaited(
+          AppTokenizer.warmUp(_tokenizer.activeEncoding()).whenComplete(
+            () => _logStartupPhase('tokenizer (background)', warm),
+          ),
+        );
+      } else {
+        scheduleMicrotask(() {
+          try {
+            _tokenizer.estimate('warm');
+          } catch (_) {
+            // The tokenizer already falls back to a heuristic on its own; a
+            // failed warm-up must not take the launch with it.
+          }
+        });
+      }
     }
   }
 
@@ -413,6 +616,11 @@ class AppState extends ChangeNotifier {
     _activeProviderId = providerState.activeId;
     _appearance = await _storage.loadAppearance();
     _chatInterface = await _storage.loadChatInterface();
+    _chatTools = await _storage.loadChatTools();
+    _btwSettings = await _storage.loadBtwSettings();
+    _btwThreads
+      ..clear()
+      ..addAll(await _storage.loadBtwThreads());
     _characters
       ..clear()
       ..addAll(await _storage.loadCharacters());
@@ -429,10 +637,15 @@ class AppState extends ChangeNotifier {
       ..clear()
       ..addAll(await _storage.loadRegexRules());
     _viewPrefs = await _storage.loadViewPrefs();
+    _homeLayout = await _storage.loadHomeLayout();
+    _homeNotes
+      ..clear()
+      ..addAll(await _storage.loadHomeNotes());
     _interfacePresets
       ..clear()
       ..addAll(await _storage.loadInterfacePresets());
     _imageGen = await _storage.loadImageGen();
+    _studioConfig = await _storage.loadStudioConfig();
     _summaryFolds
       ..clear()
       ..addAll(await _storage.loadSummaryFolds());
@@ -667,7 +880,9 @@ class AppState extends ChangeNotifier {
   /// Asks GitHub whether a newer release exists and, if so, exposes it via
   /// [availableUpdate]. Silent on any failure.
   Future<void> checkForUpdates() async {
-    final info = await _updateService.checkLatest(kAppVersion);
+    final info = kIsBeta
+        ? await _updateService.checkBeta(kBetaBuild)
+        : await _updateService.checkLatest(kAppVersion);
     if (info != null) {
       _availableUpdate = info;
       notifyListeners();
@@ -707,6 +922,7 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> selectProvider(String id) async {
+    if (_chatToolClient != null) stop();
     if (_activeProviderId == id) return;
     _activeProviderId = id;
     notifyListeners();
@@ -1010,11 +1226,14 @@ class AppState extends ChangeNotifier {
   }
 
   /// The preset a conversation runs under: its own chat-specific override, then
-  /// its referenced preset, then the app default.
-  Preset? presetFor(Conversation conversation) =>
-      conversation.presetOverride ??
-      presetById(conversation.presetId) ??
-      presetById(_defaultPresetId);
+  /// its host's live draft preset, its referenced preset, then the app default.
+  Preset? presetFor(Conversation conversation) {
+    final host = _hostOf(conversation);
+    return conversation.presetOverride ??
+        (host is ChatPresetHost ? (host as ChatPresetHost).preset : null) ??
+        presetById(conversation.presetId) ??
+        presetById(_defaultPresetId);
+  }
 
   Preset? get defaultPreset => presetById(_defaultPresetId);
   String? get defaultPresetId => _defaultPresetId;
@@ -1086,13 +1305,11 @@ class AppState extends ChangeNotifier {
     String conversationId,
     String? presetId,
   ) async {
-    for (final c in _conversations) {
-      if (c.id == conversationId) {
-        c.presetId = presetId;
-        c.presetOverride = null;
-        c.updatedAt = DateTime.now();
-        break;
-      }
+    final c = _conversationById(conversationId);
+    if (c != null) {
+      c.presetId = presetId;
+      c.presetOverride = null;
+      c.updatedAt = DateTime.now();
     }
     notifyListeners();
     await _saveConversations();
@@ -1104,12 +1321,10 @@ class AppState extends ChangeNotifier {
     String conversationId,
     Preset preset,
   ) async {
-    for (final c in _conversations) {
-      if (c.id == conversationId) {
-        c.presetOverride = Preset.fromJson(preset.toJson());
-        c.updatedAt = DateTime.now();
-        break;
-      }
+    final c = _conversationById(conversationId);
+    if (c != null) {
+      c.presetOverride = Preset.fromJson(preset.toJson());
+      c.updatedAt = DateTime.now();
     }
     notifyListeners();
     await _saveConversations();
@@ -1121,16 +1336,10 @@ class AppState extends ChangeNotifier {
   /// size, say) apply everywhere *except* that chat, with nothing on screen to
   /// explain why.
   Future<void> clearChatPresetOverride(String conversationId) async {
-    var changed = false;
-    for (final c in _conversations) {
-      if (c.id == conversationId && c.presetOverride != null) {
-        c.presetOverride = null;
-        c.updatedAt = DateTime.now();
-        changed = true;
-        break;
-      }
-    }
-    if (!changed) return;
+    final c = _conversationById(conversationId);
+    if (c == null || c.presetOverride == null) return;
+    c.presetOverride = null;
+    c.updatedAt = DateTime.now();
     notifyListeners();
     await _saveConversations();
   }
@@ -1144,13 +1353,11 @@ class AppState extends ChangeNotifier {
   /// preset" path) and binds the chat to it, clearing any override.
   Future<void> savePresetToLibrary(String conversationId, Preset preset) async {
     await savePreset(preset);
-    for (final c in _conversations) {
-      if (c.id == conversationId) {
-        c.presetId = preset.id;
-        c.presetOverride = null;
-        c.updatedAt = DateTime.now();
-        break;
-      }
+    final c = _conversationById(conversationId);
+    if (c != null) {
+      c.presetId = preset.id;
+      c.presetOverride = null;
+      c.updatedAt = DateTime.now();
     }
     notifyListeners();
     await _saveConversations();
@@ -1189,6 +1396,10 @@ class AppState extends ChangeNotifier {
       final override = conversation.characterOverrides[id];
       if (override != null) return override;
     }
+    // In a hosted chat the host's character (the Studio's live draft) is the
+    // one meant, ahead of a roster card that may share its id.
+    final hosted = _hostOf(conversation)?.character(id);
+    if (hosted != null) return hosted;
     return characterById(id);
   }
 
@@ -1202,7 +1413,7 @@ class AppState extends ChangeNotifier {
     change(conversation);
     conversation.updatedAt = DateTime.now();
     notifyListeners();
-    await _saveConversations();
+    await _saveChat(conversation);
   }
 
   /// Sets (or clears, with a null [image]) the picture drawn behind this thread.
@@ -1532,17 +1743,17 @@ class AppState extends ChangeNotifier {
   /// background. Returning immediately lets the PageView survive the same-frame
   /// provider rebuild without waiting on a platform preferences write.
   void chooseDefaultAvatar(String characterId, String ref) {
-    final character = characterById(characterId);
     final trimmed = ref.trim();
-    if (character == null || trimmed.isEmpty || character.avatar == trimmed) {
+    if (trimmed.isEmpty) return;
+    if (_editHostedCharacter(
+      characterId,
+      'Changed the portrait',
+      (c) => _wear(c, trimmed),
+    )) {
       return;
     }
-    final previous = character.avatar.trim();
-    character.avatars.remove(trimmed);
-    if (previous.isNotEmpty && !character.avatars.contains(previous)) {
-      character.avatars.insert(0, previous);
-    }
-    character.avatar = trimmed;
+    final character = characterById(characterId);
+    if (character == null || !_wear(character, trimmed)) return;
     notifyListeners();
     _saveDefaultAvatarChoiceSoon();
   }
@@ -1552,6 +1763,8 @@ class AppState extends ChangeNotifier {
   /// a failed load is impossible to bypass.
   Future<void> _saveConversations() async {
     if (!_writable) return;
+    // A change made through a general path may have been to a hosted chat.
+    _host?.save();
     await _storage.saveConversations(_conversations);
   }
 
@@ -1686,30 +1899,35 @@ class AppState extends ChangeNotifier {
   Future<void> _sweepAvatars() async {
     final store = _avatars;
     if (store == null || !_writable) return;
+    // Awaited only when there is a Studio folder to read: an extra hop on
+    // every sweep would let two sweeps interleave (a reopened app's startup
+    // sweep beside the last one's) where they otherwise run one after another.
+    final studio = _studio;
+    final studioRefs = studio == null
+        ? const <String>[]
+        : await studio.pictureRefs();
     await store.sweep([
       ..._characters.map((c) => c.avatar),
       ..._characters.expand((c) => c.avatars),
       ..._lorebooks.map((b) => b.thumbnail),
       ..._gallery.map((g) => g.image),
       ..._chatInterface.pictureRefs,
+      // The Home screen's wallpaper, and the picture a gallery widget was told
+      // to show, are referred to only from the home layout.
+      ?_homeLayout.wallpaper,
+      for (final p in _homeLayout.pages)
+        for (final t in p.tiles) ?t.str('image'),
       // A saved look holds its own background and participant-bar picture, and
       // is the only thing referring to them until it is applied.
       ..._interfacePresets.expand((p) => p.ui.pictureRefs),
-      for (final c in _conversations) ...[
-        c.backgroundImage ?? '',
-        ...c.characterOverrides.values.map((o) => o.avatar),
-        ...c.characterOverrides.values.expand((o) => o.avatars),
-        ...c.avatarOverrides.values,
-        // A chat with its own copy of the interface has its own copy of whatever
-        // pictures that copy names.
-        ...?c.interfaceOverride?.pictureRefs,
-        // A float can carry a picture the gallery never held (an avatar off an
-        // imported card), and it is on screen right now.
-        ...c.floatingImages.map((f) => f.imageRef),
-        // A picture sent in a message is part of the transcript: it has to
-        // outlive the gallery record it may have been picked from.
-        ...c.messages.expand((m) => m.images.map((i) => i.ref)),
-      ],
+      for (final c in _conversations) ...c.pictureRefs,
+      // A hosted chat's pictures are in its host's files too, but the chat on
+      // screen may hold one that has not been written there yet.
+      for (final host in [?_host, ?_formerHost])
+        for (final c in host.chats) ...c.pictureRefs,
+      // A Studio draft's portrait and the pictures sent to the Studio live only
+      // in its session files until the draft is applied.
+      ...studioRefs,
     ]);
   }
 
@@ -2142,51 +2360,67 @@ class AppState extends ChangeNotifier {
         'Restart the app and try again.',
       );
     }
-    await _startupAvatarSweep;
-    await archive.extractFiles(
-      pictures: imageDirectory,
-      vectors: _vectors?.directory,
-      onProgress: onProgress,
-    );
-
-    final current = <String, StoreEntry>{};
-    for (final entry in (await _storage.dump()).entries) {
-      if (kBackupExcludedKeys.contains(entry.key)) continue;
-      current[entry.key] = StoreEntry.of(entry.value);
-    }
-    var incoming = preserveSecrets(current: current, incoming: archive.store);
-    if (!replace) incoming = mergeStores(current, incoming);
-
-    var pictureStore = _avatars;
-    if (pictureStore == null && imageDirectory != null) {
-      pictureStore = AvatarStore(imageDirectory!);
-    }
-    pictureStore ??= await AvatarStore.open();
-    if (pictureStore != null) {
-      incoming = await sanitizeStorePictures(
-        incoming,
-        adoptPicture: pictureStore.adopt,
+    if (_btwRestoring) {
+      throw const BackupFormatException(
+        'Another backup is already being restored.',
       );
     }
+    _btwRestoring = true;
+    _btwGeneration++;
+    try {
+      // Fence off callbacks from the former side threads before any await.
+      // Existing snapshots drain before the merge reads current data and before
+      // replacement writes the archive, so none can land over restored data.
+      _cancelBtwForRestore();
+      await _btwSaves;
+      await _startupAvatarSweep;
+      await archive.extractFiles(
+        pictures: imageDirectory,
+        vectors: _vectors?.directory,
+        onProgress: onProgress,
+      );
 
-    await _storage.writeEntries(
-      <String, Object?>{
-        for (final entry in incoming.entries) entry.key: entry.value.stored,
-      },
-      replace: replace,
-      protect: kBackupExcludedKeys,
-    );
-    // Ratios describe files from the pre-restore store. Even though the entry is
-    // excluded/protected, keeping it would let a reused local name inherit stale
-    // geometry. Rebuild this derived cache from decoded restored images instead.
-    _imageRatioPersist?.cancel();
-    _imageRatioPersist = null;
-    imageRatioCache.clear();
-    await _clearStoredImageRatios();
-    await reloadFromStore();
-    // Anything on disk the restored store does not reference is a leftover.
-    await _sweepAvatars();
-    return archive.counts;
+      final current = <String, StoreEntry>{};
+      for (final entry in (await _storage.dump()).entries) {
+        if (kBackupExcludedKeys.contains(entry.key)) continue;
+        current[entry.key] = StoreEntry.of(entry.value);
+      }
+      var incoming = preserveSecrets(current: current, incoming: archive.store);
+      if (!replace) incoming = mergeStores(current, incoming);
+
+      var pictureStore = _avatars;
+      if (pictureStore == null && imageDirectory != null) {
+        pictureStore = AvatarStore(imageDirectory!);
+      }
+      pictureStore ??= await AvatarStore.open();
+      if (pictureStore != null) {
+        incoming = await sanitizeStorePictures(
+          incoming,
+          adoptPicture: pictureStore.adopt,
+        );
+      }
+
+      await _storage.writeEntries(
+        <String, Object?>{
+          for (final entry in incoming.entries) entry.key: entry.value.stored,
+        },
+        replace: replace,
+        protect: kBackupExcludedKeys,
+      );
+      // Ratios describe files from the pre-restore store. Even though the entry is
+      // excluded/protected, keeping it would let a reused local name inherit stale
+      // geometry. Rebuild this derived cache from decoded restored images instead.
+      _imageRatioPersist?.cancel();
+      _imageRatioPersist = null;
+      imageRatioCache.clear();
+      await _clearStoredImageRatios();
+      await reloadFromStore();
+      // Anything on disk the restored store does not reference is a leftover.
+      await _sweepAvatars();
+      return archive.counts;
+    } finally {
+      _btwRestoring = false;
+    }
   }
 
   /// Re-reads every store entry into memory. A restore writes the store from
@@ -2500,6 +2734,8 @@ class AppState extends ChangeNotifier {
       final override = conversation.lorebookOverrides[id];
       if (override != null) return override;
     }
+    final hosted = _hostOf(conversation)?.lorebook(id);
+    if (hosted != null) return hosted;
     return lorebookById(id);
   }
 
@@ -2930,7 +3166,8 @@ class AppState extends ChangeNotifier {
     return newId;
   }
 
-  List<String> _folderList(Folder folder, FolderItemKind kind) => switch (kind) {
+  List<String> _folderList(Folder folder, FolderItemKind kind) =>
+      switch (kind) {
         FolderItemKind.character => folder.characterIds,
         FolderItemKind.lorebook => folder.lorebookIds,
         FolderItemKind.scenario => folder.scenarioIds,
@@ -2991,12 +3228,15 @@ class AppState extends ChangeNotifier {
   /// The folder's presets/providers/lorebooks in folder order, overrides
   /// applied, dropping any whose referenced item is gone — the "Folder …" half
   /// of the split lists the chat-time pickers draw.
-  List<Preset> folderPresets(Folder folder) =>
-      [for (final id in folder.presetIds) ?folderPreset(folder, id)];
-  List<Provider> folderProviders(Folder folder) =>
-      [for (final id in folder.providerIds) ?providerById(id)];
-  List<Lorebook> folderLorebooks(Folder folder) =>
-      [for (final id in folder.lorebookIds) ?folderLorebook(folder, id)];
+  List<Preset> folderPresets(Folder folder) => [
+    for (final id in folder.presetIds) ?folderPreset(folder, id),
+  ];
+  List<Provider> folderProviders(Folder folder) => [
+    for (final id in folder.providerIds) ?providerById(id),
+  ];
+  List<Lorebook> folderLorebooks(Folder folder) => [
+    for (final id in folder.lorebookIds) ?folderLorebook(folder, id),
+  ];
 
   /// The provider [conversation] runs on: a per-chat override wins over the
   /// app-global active provider, so a foldered chat can use the folder's
@@ -3009,12 +3249,12 @@ class AppState extends ChangeNotifier {
   Future<void> setConversationProvider(
     String conversationId,
     String? providerId,
-  ) =>
-      _editConversation(
-        conversationId,
-        (c) => c.providerOverride =
-            (providerId == null || providerId.isEmpty) ? null : providerId,
-      );
+  ) => _editConversation(
+    conversationId,
+    (c) => c.providerOverride = (providerId == null || providerId.isEmpty)
+        ? null
+        : providerId,
+  );
 
   // --- Regex rules ---------------------------------------------------------
   //
@@ -3150,8 +3390,15 @@ class AppState extends ChangeNotifier {
         continue;
       }
       any = true;
-      hash = Object.hash(hash, i, r.find, r.replace, r.macroMode,
-          Object.hashAll(r.placement), Object.hashAll(r.trimStrings));
+      hash = Object.hash(
+        hash,
+        i,
+        r.find,
+        r.replace,
+        r.macroMode,
+        Object.hashAll(r.placement),
+        Object.hashAll(r.trimStrings),
+      );
     }
     return any ? hash : null;
   }
@@ -3163,22 +3410,29 @@ class AppState extends ChangeNotifier {
   /// and depth is left unset — a cosmetic rewrite runs wherever the message is
   /// shown regardless of how far back it has scrolled.
   String Function(String text, {required bool isUser})? regexDisplayTransform(
-      Conversation? conversation) {
+    Conversation? conversation,
+  ) {
     final rules = _activeRegexRules;
-    final userWork =
-        RegexEngine.hasWork(rules, target: RegexTarget.userInput, isDisplay: true);
-    final aiWork =
-        RegexEngine.hasWork(rules, target: RegexTarget.aiOutput, isDisplay: true);
+    final userWork = RegexEngine.hasWork(
+      rules,
+      target: RegexTarget.userInput,
+      isDisplay: true,
+    );
+    final aiWork = RegexEngine.hasWork(
+      rules,
+      target: RegexTarget.aiOutput,
+      isDisplay: true,
+    );
     if (!userWork && !aiWork) return null;
     final names = _regexNames(conversation);
     return (String text, {required bool isUser}) => RegexEngine.apply(
-          rules,
-          text,
-          target: isUser ? RegexTarget.userInput : RegexTarget.aiOutput,
-          isDisplay: true,
-          userName: names.user,
-          charName: names.char,
-        );
+      rules,
+      text,
+      target: isUser ? RegexTarget.userInput : RegexTarget.aiOutput,
+      isDisplay: true,
+      userName: names.user,
+      charName: names.char,
+    );
   }
 
   /// Applies the prompt-only rules to one history [message] as the prompt is
@@ -3191,7 +3445,9 @@ class AppState extends ChangeNotifier {
     required String charName,
     required List<RegexRule> rules,
   }) {
-    final target = message.isUser ? RegexTarget.userInput : RegexTarget.aiOutput;
+    final target = message.isUser
+        ? RegexTarget.userInput
+        : RegexTarget.aiOutput;
     final next = RegexEngine.apply(
       rules,
       message.content,
@@ -3227,6 +3483,23 @@ class AppState extends ChangeNotifier {
   /// Puts a chat back on the character's own scenario.
   Future<void> clearChatScenario(String conversationId) =>
       setChatScenario(conversationId);
+
+  // --- Home screen -------------------------------------------------------
+
+  HomeLayout _homeLayout = HomeLayout.defaults();
+
+  /// How the Home screen is arranged: its grid, its pages, the widgets on them.
+  HomeLayout get homeLayout => _homeLayout;
+
+  /// Replaces the arrangement. The edit mode calls this once, on Done — a drag
+  /// is held in the editor, not written to the store cell by cell.
+  Future<void> setHomeLayout(HomeLayout next) async {
+    if (next == _homeLayout) return;
+    _homeLayout = next;
+    notifyListeners();
+    if (!_writable) return;
+    await _storage.saveHomeLayout(next);
+  }
 
   // --- Browse layout -------------------------------------------------------
 
@@ -4000,6 +4273,8 @@ class AppState extends ChangeNotifier {
     var stale = false;
     for (final id in _responseHints.keys.toList()) {
       if (_conversationById(id) != null) continue;
+      // A hosted chat's host is not open at startup; its hint is kept.
+      if (id.startsWith(kHostedChatPrefix)) continue;
       _responseHints.remove(id);
       stale = true;
     }
@@ -4048,6 +4323,7 @@ class AppState extends ChangeNotifier {
     String? conversationId,
     String? characterId,
     List<MessageImage> references = const <MessageImage>[],
+    ImageClient? client,
   }) async {
     final config = _imageGen;
     if (!config.isReady) {
@@ -4058,7 +4334,7 @@ class AppState extends ChangeNotifier {
     final conversation = conversationId == null
         ? null
         : _conversationById(conversationId);
-    final result = await _imageClient.generate(
+    final result = await (client ?? _imageClient).generate(
       config: config,
       prompt: config.composePrompt(prompt),
       references: _referenceBytes(references),
@@ -4382,7 +4658,10 @@ class AppState extends ChangeNotifier {
   /// never about which pictures exist, so both pools are unioned here and the
   /// chat's own choice leads.
   List<String> avatarPoolIn(Conversation? conversation, String characterId) {
-    final roster = characterById(characterId);
+    // A hosted chat's character is the host's (the draft), and so is its pool.
+    final roster =
+        _hostOf(conversation)?.character(characterId) ??
+        characterById(characterId);
     final override = conversation?.overrideDefinitions == true
         ? conversation?.characterOverrides[characterId]
         : null;
@@ -4424,25 +4703,67 @@ class AppState extends ChangeNotifier {
   /// with no picture yet wears it straight away, so the action visibly does
   /// something the first time it is used.
   Future<void> addAvatarToPool(String characterId, String ref) async {
-    final character = characterById(characterId);
     final trimmed = ref.trim();
-    if (character == null || trimmed.isEmpty) return;
-    if (isAvatarOf(character, trimmed)) return;
-    if (character.avatar.trim().isEmpty) {
-      character.avatar = trimmed;
-    } else {
-      character.avatars.add(trimmed);
+    if (trimmed.isEmpty) return;
+    if (_editHostedCharacter(characterId, 'Added a picture to the avatars', (
+      c,
+    ) {
+      if (isAvatarOf(c, trimmed)) return false;
+      _addToPool(c, trimmed);
+      return true;
+    })) {
+      return;
     }
+    final character = characterById(characterId);
+    if (character == null) return;
+    if (isAvatarOf(character, trimmed)) return;
+    _addToPool(character, trimmed);
     character.updatedAt = DateTime.now();
     notifyListeners();
     await _persistCharacters();
   }
 
+  static void _addToPool(Character character, String ref) {
+    if (character.avatar.trim().isEmpty) {
+      character.avatar = ref;
+    } else {
+      character.avatars.add(ref);
+    }
+  }
+
+  /// A hosted chat's character is its host's (the Studio's draft), even when
+  /// a roster card shares its id: an avatar action there is handed to the
+  /// host, so it never writes the library behind the draft's back. [change]
+  /// runs once on a copy to see whether anything would change (returning
+  /// false skips the edit), then on the host's own character. True when the
+  /// host took it.
+  bool _editHostedCharacter(
+    String characterId,
+    String summary,
+    bool Function(Character c) change,
+  ) {
+    final host = _host;
+    final hosted = host?.character(characterId);
+    if (host == null || hosted == null) return false;
+    if (!change(hosted.clone())) return true;
+    host.editCharacter(characterId, summary, (c) => change(c));
+    notifyListeners();
+    return true;
+  }
+
   /// Takes [ref] back out of [character]'s pool.
   Future<void> removeAvatarFromPool(String characterId, String ref) async {
+    final refs = <String>{ref.trim()};
+    if (_editHostedCharacter(
+      characterId,
+      'Took a picture out of the avatars',
+      (c) => _dropAvatarRefs(c, refs),
+    )) {
+      return;
+    }
     final character = characterById(characterId);
     if (character == null) return;
-    if (!_dropAvatarRefs(character, <String>{ref.trim()})) return;
+    if (!_dropAvatarRefs(character, refs)) return;
     notifyListeners();
     await _persistCharacters();
   }
@@ -4455,19 +4776,34 @@ class AppState extends ChangeNotifier {
     String ref, {
     bool touch = true,
   }) async {
-    final character = characterById(characterId);
     final trimmed = ref.trim();
-    if (character == null || trimmed.isEmpty) return;
-    if (character.avatar == trimmed) return;
-    final previous = character.avatar.trim();
-    character.avatars.remove(trimmed);
-    if (previous.isNotEmpty && !character.avatars.contains(previous)) {
-      character.avatars.insert(0, previous);
+    if (trimmed.isEmpty) return;
+    if (_editHostedCharacter(
+      characterId,
+      'Changed the portrait',
+      (c) => _wear(c, trimmed),
+    )) {
+      return;
     }
-    character.avatar = trimmed;
+    final character = characterById(characterId);
+    if (character == null) return;
+    if (!_wear(character, trimmed)) return;
     if (touch) character.updatedAt = DateTime.now();
     notifyListeners();
     await _persistCharacters();
+  }
+
+  /// Puts [ref] on [character], keeping the one it wore in the pool. False
+  /// when it already wears it.
+  static bool _wear(Character character, String ref) {
+    if (character.avatar == ref) return false;
+    final previous = character.avatar.trim();
+    character.avatars.remove(ref);
+    if (previous.isNotEmpty && !character.avatars.contains(previous)) {
+      character.avatars.insert(0, previous);
+    }
+    character.avatar = ref;
+    return true;
   }
 
   /// Makes [ref] the picture [characterId] wears **in this chat only**, or clears
@@ -4653,6 +4989,27 @@ class AppState extends ChangeNotifier {
   /// a per-chat [providerOverride]), its lorebooks when [Folder.autoLorebooks]
   /// is on, and its documents when [Folder.sharedEmbeddings] is on.
   String startChatWithCharacter(Character character, {String? folderId}) {
+    final conversation = newChatWith(character, folderId: folderId);
+    _conversations.insert(0, conversation);
+    _leaveHostForMain();
+    _activeId = conversation.id;
+    notifyListeners();
+    _storage
+      ..saveActiveId(conversation.id)
+      ..saveConversations(_conversations);
+    return conversation.id;
+  }
+
+  /// A fresh thread with [character], seeded the way every new chat is — its
+  /// title, stored persona, the default persona as the user's identity, the
+  /// folder's defaults and the greetings — but kept nowhere: the caller files
+  /// it. [startChatWithCharacter] puts it in the app's list; the Studio's
+  /// Playground keeps it with its session ([ChatHost]), under [id].
+  Conversation newChatWith(
+    Character character, {
+    String? folderId,
+    String? id,
+  }) {
     final conversation = Conversation.empty()
       ..title = character.displayName
       ..characterId = character.id
@@ -4706,18 +5063,13 @@ class AppState extends ChangeNotifier {
         ChatMessage(role: 'assistant', swipes: greetings),
       );
     }
-    _conversations.insert(0, conversation);
-    _activeId = conversation.id;
-    notifyListeners();
-    _storage
-      ..saveActiveId(conversation.id)
-      ..saveConversations(_conversations);
-    return conversation.id;
+    return id == null ? conversation : conversation.copyAs(id: id);
   }
 
   /// Opens a fresh thread, reusing an existing empty one so repeated taps do
   /// not pile up blank entries.
   void newConversation() {
+    _leaveHostForMain();
     final existing = _conversations
         .where((c) => c.isEmpty)
         .cast<Conversation?>()
@@ -4737,6 +5089,14 @@ class AppState extends ChangeNotifier {
   }
 
   void selectConversation(String id) {
+    // A hosted chat is chosen through its host, never stored as the app's.
+    final hosted = _host == null ? null : _hostedChat(_host!, id);
+    if (hosted != null) {
+      _hostedId = id;
+      notifyListeners();
+      return;
+    }
+    _leaveHostForMain();
     _activeId = id;
     notifyListeners();
     _saveActiveId(id);
@@ -4746,12 +5106,10 @@ class AppState extends ChangeNotifier {
   Future<void> renameConversation(String id, String title) async {
     final trimmed = title.trim();
     if (trimmed.isEmpty) return;
-    for (final conversation in _conversations) {
-      if (conversation.id == id) {
-        conversation.title = trimmed;
-        conversation.updatedAt = DateTime.now();
-        break;
-      }
+    final conversation = _conversationById(id);
+    if (conversation != null) {
+      conversation.title = trimmed;
+      conversation.updatedAt = DateTime.now();
     }
     notifyListeners();
     await _saveConversations();
@@ -4808,11 +5166,30 @@ class AppState extends ChangeNotifier {
     }
     conversation.updatedAt = DateTime.now();
     notifyListeners();
-    await _saveConversations();
+    await _saveChat(conversation);
   }
 
   Future<void> deleteConversation(String id) async {
     if (id == active.id && _streaming) stop();
+    await _deleteBtwThreadsFor(id);
+    final host = _host;
+    if (host != null && _hostedChat(host, id) != null) {
+      // A hosted chat goes from its host, and the host always has one to show.
+      // The one on screen moves on first, so nothing reads a chat that is gone.
+      if (_hostedId == id) {
+        final rest = host.chats.where((c) => c.id != id);
+        _hostedId = rest.isEmpty ? null : rest.first.id;
+      }
+      host.remove(id);
+      _hostedId ??= host.newChat().id;
+      if (_responseHints.remove(id) != null) {
+        _hintsDirty = true;
+        unawaited(saveResponseHints());
+      }
+      notifyListeners();
+      if (_writable) host.save();
+      return;
+    }
     _conversations.removeWhere((c) => c.id == id);
     if (_activeId == id) _activeId = null;
     // The chat is gone, so its response hint has nothing left to steer.
@@ -4901,8 +5278,10 @@ class AppState extends ChangeNotifier {
         : null;
     // Permanent user-input regex rewrites the turn as it is stored (the chat
     // title and the empty check above stay on what was actually typed).
-    final storedPrompt =
-        applyRegexToUserInput(prompt, conversation: conversation);
+    final storedPrompt = applyRegexToUserInput(
+      prompt,
+      conversation: conversation,
+    );
     conversation.messages.add(
       ChatMessage(
         role: 'user',
@@ -4923,7 +5302,7 @@ class AppState extends ChangeNotifier {
         conversation.updatedAt = DateTime.now();
         _moveToTop(conversation);
         notifyListeners();
-        await _saveConversations();
+        await _saveChat(conversation);
         return;
       }
       await _generate(conversation, responder: responder);
@@ -5075,6 +5454,188 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// `/btw`: answers a side [question] about [conversation] (the active chat
+  /// when null) and returns the answer — **without** it ever becoming part of
+  /// the roleplay chat. The caller saves side exchanges separately; the next
+  /// story send knows nothing of their text. Requested tool actions and usage
+  /// are persisted through their own stores.
+  ///
+  /// The request is the chat's own: [_assemble] builds it exactly as a reply's
+  /// (preset, character, lore, summary, hint, regex — and so its single leading
+  /// `system` message), and the question goes on the end as one more `user`
+  /// turn, the way [writeForUser]'s instruction does. A reply being written
+  /// right now is left out of that context — it is not finished yet.
+  ///
+  /// It has a client of its own ([client], or a fresh one) and never touches
+  /// [streaming], so a reply in flight carries on undisturbed and the chat's
+  /// Stop still stops only that. [run] is how the sheet asking cancels it; a
+  /// cancelled question returns what had arrived. [onProgress] gets the answer
+  /// so far on the reply's paint cadence, thinking taken out.
+  ///
+  /// Throws [ChatApiException] when the request failed.
+  Future<String> askAside(
+    String question, {
+    Conversation? conversation,
+    BtwConversation? thread,
+    List<ChatMessage> sideHistory = const [],
+    ChatClient? client,
+    BtwRun? run,
+    void Function(String text)? onProgress,
+  }) async {
+    if (_btwRestoring) {
+      throw ChatApiException(
+        'Wait for the backup restore to finish before asking a side question.',
+      );
+    }
+    final chat = conversation ?? active;
+    if (thread != null && thread.conversationId != chat.id) {
+      throw ChatApiException('This side conversation belongs to another chat.');
+    }
+    final requestRun = thread == null ? run : (run ?? BtwRun());
+    if (thread != null) {
+      _btwRequests.remove(thread.id)?.cancel();
+      _btwRequests[thread.id] = requestRun!;
+    }
+    try {
+      return await _askAsideRequest(
+        question,
+        conversation: chat,
+        thread: thread,
+        sideHistory: sideHistory,
+        client: client,
+        run: requestRun,
+        onProgress: onProgress,
+      );
+    } finally {
+      if (thread != null && identical(_btwRequests[thread.id], requestRun)) {
+        _btwRequests.remove(thread.id);
+      }
+    }
+  }
+
+  Future<String> _askAsideRequest(
+    String question, {
+    Conversation? conversation,
+    BtwConversation? thread,
+    List<ChatMessage> sideHistory = const [],
+    ChatClient? client,
+    BtwRun? run,
+    void Function(String text)? onProgress,
+  }) async {
+    final requestGeneration = _btwGeneration;
+    final chat = conversation ?? active;
+    if (thread != null && thread.conversationId != chat.id) {
+      throw ChatApiException('This side conversation belongs to another chat.');
+    }
+    if (btwToolsEnabledFor(thread, conversation: chat)) {
+      return _askAsideWithTools(
+        question,
+        chat,
+        thread: thread,
+        sideHistory: sideHistory,
+        run: run,
+        onProgress: onProgress,
+      );
+    }
+    final preset = presetFor(chat);
+    final base = btwProviderFor(thread, conversation: chat);
+    if (base == null) {
+      throw ChatApiException('Set up a provider in Settings first.');
+    }
+    final blocked = blockingBudget(base, base.model);
+    if (blocked != null) throw ChatApiException(describeBudgetBlock(blocked));
+
+    // The turn a reply is streaming into is the last one, and only half there.
+    final generating =
+        _streaming &&
+        !_writingForUser &&
+        identical(chat, active) &&
+        chat.messages.isNotEmpty &&
+        !chat.messages.last.isUser;
+    final assembled = _assemble(
+      chat,
+      historyEnd: generating ? chat.messages.length - 1 : null,
+      providerOverride: thread == null ? null : base,
+      toolsEnabled: thread?.toolsEnabled,
+      leadingSystemOverride: thread?.systemPrompt,
+    );
+    final source = _btwSource(assembled.messages, thread);
+    final side = btwHistory(_btwPriorTurns(thread, sideHistory));
+    List<ChatMessage> payload() => _wirePayload([
+      ...source,
+      ...side,
+    ], instruction: chatBtwInstruction(question));
+    var history = payload();
+    int cost() => history.fold<int>(0, (sum, message) => sum + _cost(message));
+    while (cost() + (assembled.params.maxTokens ?? 1024) >
+        assembled.maxContext) {
+      final removable = source.indexWhere(
+        (message) => message.role != 'system' && !message.promptProtected,
+        1,
+      );
+      if (removable < 0) {
+        throw ChatApiException(
+          'The side conversation exceeds this model’s context. Start a new side thread.',
+        );
+      }
+      source.removeAt(removable);
+      history = payload();
+    }
+    final inputTokens = cost();
+    final tags = ReasoningTags(
+      start: preset?.thinkStartTag.trim() ?? '',
+      end: preset?.thinkEndTag.trim() ?? '',
+    );
+    final http = client ?? ChatClient();
+    run?.onCancel(http.cancel);
+    final provider = _applyKey(base);
+    final raw = StringBuffer();
+    TokenUsage? reported;
+    var sent = false;
+    String answer() => splitReasoning(raw.toString(), tags).text.trim();
+    try {
+      if (run?.cancelled ?? false) return '';
+      sent = true;
+      final clock = Stopwatch()..start();
+      var painted = -_streamPaintMs;
+      await for (final delta in http.streamChat(
+        provider: provider,
+        history: history,
+        params: assembled.params,
+      )) {
+        if (delta.usage != null) reported = _mergeUsage(reported, delta.usage!);
+        if (delta.text.isEmpty) continue;
+        raw.write(delta.text);
+        final now = clock.elapsedMilliseconds;
+        if (now - painted < _streamPaintMs) continue;
+        painted = now;
+        onProgress?.call(answer());
+      }
+      final text = answer();
+      onProgress?.call(text);
+      return text;
+    } on ChatApiException {
+      // Put away mid-answer: the closed connection is not a failure.
+      if (run?.cancelled ?? false) return answer();
+      _advanceKeyOnError(base);
+      rethrow;
+    } finally {
+      if (sent && requestGeneration == _btwGeneration) {
+        recordUsage(
+          base,
+          base.model,
+          reported ??
+              TokenUsage(
+                inputTokens: inputTokens,
+                outputTokens: _tokenizer.estimate(raw.toString()),
+                estimated: true,
+              ),
+        );
+        await _persistBtwUsage(requestGeneration);
+      }
+    }
+  }
+
   /// Runs one exchange of a helper conversation that is **not** part of any chat:
   /// [messages] go out exactly as given and the whole reply comes back as a
   /// string. This is the door behind "let the AI write this for you" in the
@@ -5165,6 +5726,378 @@ class AppState extends ChangeNotifier {
       await _persistUsage();
       notifyListeners();
     }
+  }
+
+  // --- Character Studio ---------------------------------------------------
+  //
+  // The Studio runs its own agents with their own clients, so it neither waits
+  // on nor blocks a chat: none of this touches [_streaming]. What it shares with
+  // a send is everything that makes a request safe to make — the budget refusal,
+  // key rotation, and the usage ledger.
+
+  StudioConfig _studioConfig = const StudioConfig();
+
+  /// How the Studio talks to its model.
+  StudioConfig get studioConfig => _studioConfig;
+
+  final List<HomeNote> _homeNotes = <HomeNote>[];
+
+  /// The Home screen's notes, newest edit first.
+  List<HomeNote> get homeNotes => List.unmodifiable(
+    [..._homeNotes]..sort((a, b) => b.updatedAt.compareTo(a.updatedAt)),
+  );
+
+  HomeNote? homeNoteById(String? id) {
+    if (id == null) return null;
+    for (final n in _homeNotes) {
+      if (n.id == id) return n;
+    }
+    return null;
+  }
+
+  /// Adds or replaces [note]. The editor calls this when typing pauses and when
+  /// it closes — never per keystroke.
+  Future<void> saveHomeNote(HomeNote note) async {
+    final i = _homeNotes.indexWhere((n) => n.id == note.id);
+    if (i >= 0) {
+      if (_homeNotes[i] == note) return;
+      _homeNotes[i] = note;
+    } else {
+      _homeNotes.add(note);
+    }
+    notifyListeners();
+    if (!_writable) return;
+    await _storage.saveHomeNotes(_homeNotes);
+  }
+
+  Future<void> deleteHomeNote(String id) async {
+    final before = _homeNotes.length;
+    _homeNotes.removeWhere((n) => n.id == id);
+    if (_homeNotes.length == before) return;
+    notifyListeners();
+    if (!_writable) return;
+    await _storage.saveHomeNotes(_homeNotes);
+  }
+
+  /// Where Studio sessions are kept, or null when the platform named no folder
+  /// (and in widget tests). The Home screen's Studio widget lists from it.
+  StudioStore? get studioStore => _studio;
+
+  Future<void> updateStudioConfig(StudioConfig next) async {
+    _studioConfig = next;
+    notifyListeners();
+    if (!_writable) return;
+    await _storage.saveStudioConfig(next);
+  }
+
+  /// The provider the Studio will use, with its model applied: the one named in
+  /// [studioConfig] when it still exists, else the one chats use.
+  Provider? studioProvider() {
+    Provider? base;
+    final id = _studioConfig.providerId;
+    if (id != null) {
+      for (final p in _providers) {
+        if (p.id == id) base = p;
+      }
+    }
+    base ??= _resolveProvider(defaultPreset);
+    if (base == null) return null;
+    final model = _studioConfig.model.trim();
+    return model.isEmpty || model == base.model
+        ? base
+        : base.copyWith(model: model);
+  }
+
+  /// One metered agent turn for the Studio over [client] (which the caller owns,
+  /// so it can cancel it). [onSpend] is told what the turn cost once it ends —
+  /// the host's own counts when it sent any, the tokenizer's estimate otherwise.
+  Stream<AgentDelta> streamAgentTurn({
+    required AgentClient client,
+    required List<AgentMessage> messages,
+    required List<ToolSpec> tools,
+    bool toolsOff = false,
+    void Function(TokenUsage usage, double cost)? onSpend,
+    // A sub-agent type the user gave a model of its own runs on that model.
+    String? model,
+  }) async* {
+    final wire = studioWireRequest(
+      messages: messages,
+      tools: tools,
+      toolsOff: toolsOff,
+      model: model,
+    );
+    if (wire == null) {
+      throw ChatApiException('Set up a provider in Settings first.');
+    }
+    final base = wire.provider;
+    final blocked = blockingBudget(base, base.model);
+    if (blocked != null) throw ChatApiException(describeBudgetBlock(blocked));
+    final provider = _applyKey(base);
+    TokenUsage? reported;
+    final written = StringBuffer();
+    var ok = false;
+    try {
+      await for (final delta in client.stream(
+        provider: provider,
+        messages: wire.messages,
+        tools: wire.tools,
+        params: wire.params,
+      )) {
+        if (delta.usage != null) reported = _mergeUsage(reported, delta.usage!);
+        written.write(delta.text);
+        for (final call in delta.toolCalls) {
+          written.write(jsonEncode(call.arguments));
+        }
+        yield delta;
+      }
+      ok = true;
+    } on ChatApiException {
+      _advanceKeyOnError(base);
+      rethrow;
+    } finally {
+      var input = 0;
+      for (final m in messages) {
+        input += _tokenizer.estimate(m.text) + _perMessageOverhead;
+      }
+      final usage =
+          reported ??
+          TokenUsage(
+            inputTokens: ok || written.isNotEmpty ? input : 0,
+            outputTokens: _tokenizer.estimate(written.toString()),
+            estimated: true,
+          );
+      recordUsage(base, base.model, usage);
+      final price = base
+          .priceOf(base.model)
+          ?.costOf(usage.inputTokens, usage.outputTokens);
+      onSpend?.call(usage, (price?.input ?? 0) + (price?.output ?? 0));
+      await _persistUsage();
+      notifyListeners();
+    }
+  }
+
+  /// The Studio request for [messages] and [tools], assembled exactly as
+  /// [streamAgentTurn] sends it — provider and model (a sub-agent type's own
+  /// [model] when it has one), pictures resolved, sampling — or null when no
+  /// provider is set up. The context inspector shows this; the run sends it.
+  /// It picks no key: rotating keys is a side effect of sending.
+  AgentWireRequest? studioWireRequest({
+    required List<AgentMessage> messages,
+    required List<ToolSpec> tools,
+    bool toolsOff = false,
+    String? model,
+  }) {
+    final studio = studioProvider();
+    final base = studio == null || model == null || model.trim().isEmpty
+        ? studio
+        : studio.copyWith(model: model.trim());
+    if (base == null) return null;
+    return AgentWireRequest(
+      provider: base,
+      messages: withWireImages(messages),
+      tools: tools,
+      params: AgentParams(
+        temperature: _studioConfig.temperature,
+        maxTokens: _studioConfig.maxTokens,
+        stream: _studioConfig.stream,
+        toolsOff: toolsOff,
+      ),
+    );
+  }
+
+  /// Folds a newly reported usage into what a turn has reported so far.
+  /// Anthropic splits its counts across two events (input first, output last);
+  /// Gemini and the OpenAI dialects send a running or final total, so the
+  /// larger of each number wins.
+  static TokenUsage _mergeUsage(TokenUsage? so, TokenUsage next) {
+    if (so == null) return next;
+    return TokenUsage(
+      inputTokens: max(so.inputTokens, next.inputTokens),
+      outputTokens: max(so.outputTokens, next.outputTokens),
+      reasoningTokens: max(so.reasoningTokens, next.reasoningTokens),
+      cachedTokens: max(so.cachedTokens, next.cachedTokens),
+    );
+  }
+
+  /// Plays [character] — a Studio draft, not necessarily a stored card — in a
+  /// throwaway chat and returns its replies, one per line of [userTurns].
+  ///
+  /// The chat is never stored. It carries the draft as a per-chat character
+  /// override and the draft's [lorebooks] as per-chat book overrides, so the
+  /// request goes through [_assemble] exactly as a real chat with the finished
+  /// card would: the chat's preset, persona, provider, lorebook scan and regex
+  /// rules all apply. That is the point of a playtest — it is the real prompt,
+  /// not a re-derivation of it.
+  ///
+  /// [transcript], when given, is the playtest so far (the greeting and every
+  /// turn since) and replaces the greeting — how a Playground chat or an
+  /// agent's continued playtest carries on. [scenario] is a situation for this
+  /// test alone, laid over the card's own as a chat's scenario would be.
+  /// [preset] is a Studio working copy; when absent the usual chat preset
+  /// applies. It is copied onto the throwaway chat, never into the library.
+  /// [onText] hears the reply so far as it streams, reasoning split off.
+  Future<List<String>> playtestCharacter({
+    required Character character,
+    Preset? preset,
+    List<Lorebook> lorebooks = const <Lorebook>[],
+    required List<String> userTurns,
+    int greetingIndex = 0,
+    List<ChatMessage>? transcript,
+    String scenario = '',
+    ChatClient? client,
+    void Function(String text)? onText,
+  }) async {
+    final conversation = _playtestConversation(
+      character: character,
+      preset: preset,
+      lorebooks: lorebooks,
+      greetingIndex: greetingIndex,
+      transcript: transcript,
+      scenario: scenario,
+    );
+    final chat = client ?? ChatClient();
+    final replies = <String>[];
+    for (final turn in userTurns) {
+      conversation.messages.add(ChatMessage(role: 'user', content: turn));
+      final preset = presetFor(conversation);
+      final base = _resolveProvider(preset, conversation: conversation);
+      if (base == null) {
+        throw ChatApiException('Set up a provider in Settings first.');
+      }
+      final blocked = blockingBudget(base, base.model);
+      if (blocked != null) throw ChatApiException(describeBudgetBlock(blocked));
+      final assembled = _assemble(conversation);
+      final provider = _applyKey(base);
+      final tags = ReasoningTags(
+        start: preset?.thinkStartTag.trim() ?? '',
+        end: preset?.thinkEndTag.trim() ?? '',
+      );
+      final raw = StringBuffer();
+      TokenUsage? reported;
+      try {
+        await for (final delta in chat.streamChat(
+          provider: provider,
+          history: assembled.messages,
+          params: assembled.params,
+        )) {
+          raw.write(delta.text);
+          if (delta.usage != null) {
+            reported = _mergeUsage(reported, delta.usage!);
+          }
+          if (onText != null && delta.text.isNotEmpty) {
+            onText(splitReasoning(raw.toString(), tags).text);
+          }
+        }
+      } on ChatApiException {
+        _advanceKeyOnError(base);
+        rethrow;
+      } finally {
+        recordUsage(
+          base,
+          base.model,
+          reported ??
+              TokenUsage(
+                inputTokens: assembled.totalTokens,
+                outputTokens: _tokenizer.estimate(raw.toString()),
+                estimated: true,
+              ),
+        );
+      }
+      final reply = splitReasoning(raw.toString(), tags).text.trim();
+      replies.add(reply);
+      conversation.messages.add(ChatMessage(role: 'assistant', content: reply));
+    }
+    await _persistUsage();
+    notifyListeners();
+    return replies;
+  }
+
+  /// How big the prompt of a chat with [character] would be on its first
+  /// reply — the preset, persona, card, lore and greeting, assembled through
+  /// [_assemble] exactly as a playtest sends it — beside the context the
+  /// preset allows. Nothing is sent. Null when no provider is set up.
+  /// Uses [preset] when supplied, just like [playtestCharacter].
+  ({int tokens, int context, List<PromptSection> sections})?
+  playtestPromptSize({
+    required Character character,
+    Preset? preset,
+    List<Lorebook> lorebooks = const <Lorebook>[],
+    int greetingIndex = 0,
+    String userTurn = 'Hello.',
+  }) {
+    final conversation = _playtestConversation(
+      character: character,
+      preset: preset,
+      lorebooks: lorebooks,
+      greetingIndex: greetingIndex,
+    );
+    conversation.messages.add(ChatMessage(role: 'user', content: userTurn));
+    final selected = presetFor(conversation);
+    if (_resolveProvider(selected, conversation: conversation) == null) {
+      return null;
+    }
+    final assembled = _assemble(conversation);
+    return (
+      tokens: assembled.totalTokens,
+      context: assembled.maxContext,
+      sections: assembled.sections,
+    );
+  }
+
+  /// The throwaway, never-stored chat a playtest runs in: the draft as a
+  /// per-chat override, its books likewise, opening on the chosen greeting —
+  /// or on [transcript], when a playtest carries on.
+  Conversation _playtestConversation({
+    required Character character,
+    Preset? preset,
+    required List<Lorebook> lorebooks,
+    int greetingIndex = 0,
+    List<ChatMessage>? transcript,
+    String scenario = '',
+  }) {
+    final now = DateTime.now();
+    final greetings = character.greetings;
+    // Seed the same persona and folder defaults as a Playground chat, so the
+    // agent's test and prompt measurement use the connection the user plays on.
+    final conversation =
+        newChatWith(
+            character,
+            id: 'studio-playtest-${now.microsecondsSinceEpoch}',
+          )
+          ..title = 'Playtest'
+          ..messages.clear()
+          ..overrideDefinitions = true
+          ..characterOverrides.addAll({character.id: character})
+          ..lorebookOverrides.addAll({for (final b in lorebooks) b.id: b})
+          ..scenarioOverride = scenario.trim()
+          ..presetOverride = preset?.clone();
+    final persona = impersonationFor(conversation);
+    final userName = persona?.displayName ?? 'User';
+    String resolve(String text) => Character.resolveMacros(
+      text,
+      charName: character.displayName,
+      userName: userName,
+    );
+    if (transcript != null) {
+      for (final m in transcript) {
+        conversation.messages.add(
+          ChatMessage(
+            role: m.role,
+            content: m.role == 'assistant' ? resolve(m.content) : m.content,
+          ),
+        );
+      }
+    } else if (greetings.isNotEmpty) {
+      conversation.messages.add(
+        ChatMessage(
+          role: 'assistant',
+          content: resolve(
+            greetings[greetingIndex.clamp(0, greetings.length - 1)],
+          ),
+        ),
+      );
+    }
+    return conversation;
   }
 
   /// What the model is told when it is writing the user's line rather than the
@@ -5261,6 +6194,18 @@ class AppState extends ChangeNotifier {
     bool nudgeNewReply = false,
     Character? responder,
   }) async {
+    if (chatToolConfigFor(conversation).enabled ||
+        chatToolProjection(
+          conversation,
+        ).values.keys.any((key) => key.startsWith('injection:'))) {
+      return _generateWithTools(
+        conversation,
+        swipeInto: swipeInto,
+        continueAt: continueAt,
+        nudgeNewReply: nudgeNewReply,
+        responder: responder,
+      );
+    }
     final preset = presetFor(conversation);
     final base = _resolveProvider(preset, conversation: conversation);
     if (base == null) return;
@@ -5329,6 +6274,7 @@ class AppState extends ChangeNotifier {
       conversation,
       historyEnd: target,
       responder: speaker,
+      commitMacroEffects: true,
     );
     final history = _wirePayload(
       assembled.messages,
@@ -5441,7 +6387,8 @@ class AppState extends ChangeNotifier {
         _replaceAt(
           conversation,
           target,
-          content: prefix +
+          content:
+              prefix +
               applyRegexToOutput(
                 answer,
                 target: RegexTarget.aiOutput,
@@ -5491,7 +6438,8 @@ class AppState extends ChangeNotifier {
           _replaceAt(
             conversation,
             target,
-            content: prefix +
+            content:
+                prefix +
                 applyRegexToOutput(
                   answer,
                   target: RegexTarget.aiOutput,
@@ -5543,7 +6491,7 @@ class AppState extends ChangeNotifier {
       // waits for the frame carrying the last of the reply rather than holding
       // it back — the alternative is a visible hitch exactly as a reply lands.
       await _letTheFrameLand();
-      await _saveConversations();
+      await _saveChat(conversation);
       await _persistUsage();
       // Deliberately *not* saving the macro scopes here. The engine never
       // touches MacroVariables (grep macro_engine.dart), so this was a second
@@ -5652,7 +6600,7 @@ class AppState extends ChangeNotifier {
     conversation.updatedAt = DateTime.now();
     _moveToTop(conversation);
     notifyListeners();
-    unawaited(_saveConversations());
+    unawaited(_saveChat(conversation));
   }
 
   /// Joins provider-returned thinking with thinking parsed out of the reply
@@ -5669,6 +6617,12 @@ class AppState extends ChangeNotifier {
     for (final c in _conversations) {
       if (c.id == id) return c;
     }
+    // A hosted chat (the Studio's Playground) is found by the same actions.
+    for (final host in [?_host, ?_formerHost]) {
+      for (final c in host.chats) {
+        if (c.id == id) return c;
+      }
+    }
     return null;
   }
 
@@ -5679,6 +6633,7 @@ class AppState extends ChangeNotifier {
     int index,
     String content,
   ) async {
+    _toolProjectionCache.clear();
     final trimmed = content.trim();
     if (trimmed.isEmpty) return;
     final conversation = _conversationById(conversationId);
@@ -5689,12 +6644,13 @@ class AppState extends ChangeNotifier {
     );
     conversation.updatedAt = DateTime.now();
     notifyListeners();
-    await _saveConversations();
+    await _saveChat(conversation);
   }
 
   /// Removes the message at [index] — the "delete turn" action. Ignored while
   /// the active conversation is streaming, to avoid racing the in-flight reply.
   Future<void> deleteMessage(String conversationId, int index) async {
+    _toolProjectionCache.clear();
     final conversation = _conversationById(conversationId);
     if (conversation == null) return;
     if (_streaming && _activeOrNull()?.id == conversation.id) return;
@@ -5702,7 +6658,7 @@ class AppState extends ChangeNotifier {
     conversation.messages.removeAt(index);
     conversation.updatedAt = DateTime.now();
     notifyListeners();
-    await _saveConversations();
+    await _saveChat(conversation);
   }
 
   /// Removes the message at [index] **and everything after it** — "delete from
@@ -5725,7 +6681,7 @@ class AppState extends ChangeNotifier {
     conversation.messages.removeRange(index, conversation.messages.length);
     conversation.updatedAt = DateTime.now();
     notifyListeners();
-    await _saveConversations();
+    await _saveChat(conversation);
   }
 
   /// Copies messages [0..index] (inclusive) into a NEW thread, makes it active,
@@ -5746,8 +6702,11 @@ class AppState extends ChangeNotifier {
       for (var i = 0; i <= end; i++)
         ChatMessage.fromJson(source.messages[i].toJson()),
     ];
+    final host = _hostOf(source);
     final fork = source.copyAs(
-      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      id:
+          '${host == null ? '' : kHostedChatPrefix}'
+          '${DateTime.now().microsecondsSinceEpoch}',
       // Branches are named after the tree's root rather than piling up
       // "(fork) (fork)" suffixes: the graph already says where each split, and
       // the root's title is what the chat lists show.
@@ -5769,6 +6728,14 @@ class AppState extends ChangeNotifier {
       _hintsDirty = true;
       unawaited(saveResponseHints());
     }
+    if (host != null) {
+      // A branch of a hosted chat stays with its host, as a chat of its own.
+      host.adopt(fork);
+      if (identical(host, _host)) _hostedId = fork.id;
+      notifyListeners();
+      if (_writable) host.save();
+      return fork.id;
+    }
     _conversations.insert(0, fork);
     _activeId = fork.id;
     notifyListeners();
@@ -5782,12 +6749,11 @@ class AppState extends ChangeNotifier {
   /// two branches in one family read alike. The graph row says which chat it
   /// actually split from, so the title does not have to.
   String _branchTitle(Conversation source) {
-    final rootId = rootIdOf(_conversations, source.id);
+    final pool = _hostOf(source)?.chats ?? _conversations;
+    final rootId = rootIdOf(pool, source.id);
     final root = _conversationById(rootId) ?? source;
-    final inTree = _conversations
-        .where(
-          (c) => c.id != rootId && rootIdOf(_conversations, c.id) == rootId,
-        )
+    final inTree = pool
+        .where((c) => c.id != rootId && rootIdOf(pool, c.id) == rootId)
         .length;
     return '${root.title} · Branch ${inTree + 1}';
   }
@@ -5827,6 +6793,7 @@ class AppState extends ChangeNotifier {
     int index,
     int swipeIndex,
   ) async {
+    _toolProjectionCache.clear();
     if (_streaming) return;
     final conversation = _conversationById(conversationId);
     if (conversation == null) return;
@@ -6051,7 +7018,13 @@ class AppState extends ChangeNotifier {
 
   static const int _perMessageOverhead = 4; // mirrors PromptBuilder
   int _cost(ChatMessage m) =>
-      _tokenizer.estimate(m.content) + _perMessageOverhead;
+      _tokenizer.estimate(m.content) +
+      _perMessageOverhead +
+      (m.toolRun == null
+          ? 0
+          : _tokenizer.estimate(
+              jsonEncode(m.toolRun!.history.map((v) => v.toJson()).toList()),
+            ));
 
   /// The app-wide tokenizer choice (OpenAI / Anthropic / Custom).
   TokenizerConfig get tokenizerConfig => _tokenizerConfig;
@@ -6066,6 +7039,14 @@ class AppState extends ChangeNotifier {
   Future<void> updateTokenizerConfig(TokenizerConfig next) async {
     if (next == _tokenizerConfig) return;
     _tokenizerConfig = next;
+    if (next.kind == TokenizerKind.none) {
+      // Switched off: free the vocabularies now rather than at next launch.
+      AppTokenizer.release();
+    } else if (backgroundWarmUp) {
+      // Switched (back) on: build the new encoding off the UI thread, so the
+      // first count after the change is not a freeze.
+      unawaited(AppTokenizer.warmUp(_tokenizer.activeEncoding()));
+    }
     notifyListeners();
     if (!_writable) return;
     await _storage.saveTokenizerConfig(next);
@@ -6106,10 +7087,28 @@ class AppState extends ChangeNotifier {
   /// about what the app transmits can be checked against the actual bytes
   /// instead of an approximation. Null when no provider is configured.
   String? requestPreview(AssembledPrompt assembled) {
+    final saved = _chatToolRequests[assembled.toolRunId];
+    if (saved != null && saved.isNotEmpty) {
+      return [
+        for (var i = 0; i < saved.length; i++) 'Request ${i + 1}\n${saved[i]}',
+      ].join('\n\n');
+    }
     final conversation = _activeOrNull() ?? active;
     final preset = presetFor(conversation);
     final provider = _resolveProvider(preset, conversation: conversation);
     if (provider == null) return null;
+    if (chatToolConfigFor(conversation).enabled) {
+      return AgentWireRequest(
+        provider: provider,
+        messages: _chatToolPayload(assembled.messages, provider),
+        tools: _availableChatTools(conversation).map((d) => d.spec).toList(),
+        params: AgentParams(
+          stream: assembled.params.stream,
+          generation: assembled.params,
+          requireToolCompletion: true,
+        ),
+      ).preview();
+    }
     return _client.requestPreview(
       _applyKey(provider),
       assembled.messages,
@@ -6126,9 +7125,19 @@ class AppState extends ChangeNotifier {
     Conversation conversation, {
     int? historyEnd,
     Character? responder,
+    bool commitMacroEffects = false,
+    Provider? providerOverride,
+    bool? toolsEnabled,
+    String? leadingSystemOverride,
   }) {
+    final customSystem = leadingSystemOverride?.trim() ?? '';
     final preset = presetFor(conversation);
-    final model = _resolveProvider(preset, conversation: conversation)?.model ?? '';
+    final model =
+        (providerOverride ??
+                _resolveProvider(preset, conversation: conversation))
+            ?.model ??
+        '';
+    final useTools = toolsEnabled ?? chatToolConfigFor(conversation).enabled;
 
     final considered = historyEnd == null
         ? conversation.messages
@@ -6136,8 +7145,30 @@ class AppState extends ChangeNotifier {
               .take(historyEnd.clamp(0, conversation.messages.length))
               .toList();
     // Failure notices are display-only, so they never go back to the model.
+    final staleRuns = chatToolProjection(
+      conversation,
+      historyEnd: historyEnd,
+    ).staleRuns;
     final priorTurns = considered
         .where((m) => !m.error)
+        .map((m) {
+          if (staleRuns.contains(m.toolRun?.id)) {
+            return m.copyWith(
+              clearToolRun: true,
+              content:
+                  '[Earlier outcome changed; recorded tool effects are stale.]\n${m.content}',
+            );
+          }
+          if (!useTools && m.toolRun != null) {
+            return m.copyWith(
+              clearToolRun: true,
+              content:
+                  '[Recorded tool results]\n'
+                  '${jsonEncode(m.toolRun!.history.where((v) => v.role == AgentRole.tool).map((v) => {'tool': v.toolName, 'result': v.text}).toList())}\n${m.content}',
+            );
+          }
+          return m;
+        })
         .toList(growable: false);
 
     // A preset's {{input}} is the latest user turn in the considered window.
@@ -6167,7 +7198,20 @@ class AppState extends ChangeNotifier {
         : impersonation.userPersona(
             charName: character?.displayName ?? 'the character',
           );
-    final maxContext = _effectiveMaxContext(preset, model);
+    final toolReserve = useTools
+        ? _tokenizer.estimate(
+                jsonEncode(
+                  _availableChatTools(
+                    conversation,
+                  ).map((d) => d.spec.parameters).toList(),
+                ),
+              ) +
+              256
+        : 0;
+    final maxContext = max(
+      256,
+      _effectiveMaxContext(preset, model) - toolReserve,
+    );
 
     // Which of the three scenarios this turn runs under, resolved once here so
     // the marker block, the fallbacks below and the inspectors all agree.
@@ -6203,9 +7247,14 @@ class AppState extends ChangeNotifier {
     final prefix = <ChatMessage>[];
     final sections = <PromptSection>[];
     void addPrefix(String label, String content) {
+      if (customSystem.isNotEmpty) return;
       final trimmed = content.trim();
       if (trimmed.isEmpty) return;
-      final m = ChatMessage(role: 'system', content: trimmed);
+      final m = ChatMessage(
+        role: 'system',
+        content: trimmed,
+        promptProtected: true,
+      );
       prefix.add(m);
       sections.add(
         PromptSection(
@@ -6237,12 +7286,20 @@ class AppState extends ChangeNotifier {
     // when no prompt-only rule targets a message role, so the common case (no
     // regex, or only permanent/display rules) copies nothing.
     final promptRules = _activeRegexRules;
-    final promptRegexNeeded = RegexEngine.hasWork(promptRules,
-            target: RegexTarget.userInput, isPrompt: true) ||
-        RegexEngine.hasWork(promptRules,
-            target: RegexTarget.aiOutput, isPrompt: true);
+    final promptRegexNeeded =
+        RegexEngine.hasWork(
+          promptRules,
+          target: RegexTarget.userInput,
+          isPrompt: true,
+        ) ||
+        RegexEngine.hasWork(
+          promptRules,
+          target: RegexTarget.aiOutput,
+          isPrompt: true,
+        );
     if (promptRegexNeeded) {
-      final charName = character?.displayName ?? conversation.characterName ?? '';
+      final charName =
+          character?.displayName ?? conversation.characterName ?? '';
       final count = history.length;
       history = [
         for (var i = 0; i < count; i++)
@@ -6270,6 +7327,27 @@ class AppState extends ChangeNotifier {
 
     List<ChatMessage> messages;
     var params = const GenParams();
+    final toolState = chatToolProjection(
+      conversation,
+      historyEnd: historyEnd,
+    ).values;
+    if (useTools) {
+      addPrefix(
+        'Chat tools',
+        'Use the available function tools for dice and tracker changes. '
+            'Tool results are authoritative. Current trackers: '
+            '${jsonEncode({for (final e in toolState.entries)
+              if (e.key.startsWith('tracker:')) e.key: e.value})}',
+      );
+    }
+    final corrections = <({String text, int depth})>[
+      for (final entry in toolState.entries)
+        if (entry.key.startsWith('injection:') && entry.value is Map)
+          (
+            text: '[OOC correction: ${(entry.value as Map)['text']}]',
+            depth: ((entry.value as Map)['depth'] as num?)?.toInt() ?? 0,
+          ),
+    ];
 
     // The running summary, when enabled, feeds both the {{summary}} macro and the
     // auto-injection fallback (used when the preset places no {{summary}}).
@@ -6288,8 +7366,10 @@ class AppState extends ChangeNotifier {
         userName: userName,
         persona: persona,
         variables: MacroVariables(
-          local: conversation.variables,
-          global: _globalVars,
+          local: commitMacroEffects
+              ? conversation.variables
+              : Map.of(conversation.variables),
+          global: commitMacroEffects ? _globalVars : Map.of(_globalVars),
         ),
         input: input,
         lore: lore,
@@ -6301,6 +7381,8 @@ class AppState extends ChangeNotifier {
         scenario: scenario,
         hintText: hintText,
         hintDepth: responseHintDepth,
+        controlInjections: corrections,
+        leadingSystemOverride: customSystem,
       );
       // Robustness: the preset fills the character definition from the *live*
       // character via its marker blocks. Two ways that definition can silently
@@ -6415,6 +7497,7 @@ class AppState extends ChangeNotifier {
       ChatMessage? hintMessage;
       if (hintText.isNotEmpty) {
         hintMessage = ChatMessage(
+          promptProtected: true,
           role: 'user',
           content: PromptBuilder.wrapResponseHint(hintText),
         );
@@ -6423,6 +7506,25 @@ class AppState extends ChangeNotifier {
           withHint.length,
         );
         withHint.insert(at, hintMessage);
+      }
+      for (final control in corrections) {
+        final at = (history.length - control.depth).clamp(0, history.length);
+        final position =
+            hintMessage != null && control.depth == responseHintDepth
+            ? withHint.indexOf(hintMessage)
+            : at == history.length
+            ? withHint.length
+            : withHint.indexOf(history[at]);
+        final instruction = ChatMessage(role: 'user', content: control.text);
+        withHint.insert(position, instruction);
+        sections.add(
+          PromptSection(
+            label: 'OOC correction (depth ${control.depth})',
+            role: 'user',
+            tokens: _cost(instruction),
+            messageCount: 1,
+          ),
+        );
       }
       messages = <ChatMessage>[...prefix, ...withHint];
       if (history.isNotEmpty) {
@@ -6447,6 +7549,27 @@ class AppState extends ChangeNotifier {
       }
     }
 
+    if (customSystem.isNotEmpty && preset == null) {
+      final system = ChatMessage(
+        role: 'system',
+        content: customSystem,
+        promptProtected: true,
+      );
+      messages = [
+        system,
+        for (final message in messages)
+          if (message.role != 'system') message,
+      ];
+      sections.insert(
+        0,
+        PromptSection(
+          label: 'Side system prompt',
+          role: 'system',
+          tokens: _cost(system),
+          messageCount: 1,
+        ),
+      );
+    }
     final total = sections.fold<int>(0, (s, x) => s + x.tokens);
     return AssembledPrompt(
       // Merge again after the prefix is prepended, so an injected leading system
@@ -6457,7 +7580,7 @@ class AppState extends ChangeNotifier {
       params: params,
       sections: sections,
       totalTokens: total,
-      maxContext: maxContext,
+      maxContext: maxContext + toolReserve,
     );
   }
 
@@ -6509,6 +7632,46 @@ class AppState extends ChangeNotifier {
         budget--;
       }
       out[i] = message.copyWith(images: kept);
+    }
+    return out;
+  }
+
+  /// [images] as they go on the wire: an online picture as it is, a stored one
+  /// with its base64 read in, one whose file has gone dropped. At most [budget]
+  /// are kept, the newest (last) first.
+  List<MessageImage> wireImagesFor(
+    List<MessageImage> images, {
+    int budget = kMaxWireImages,
+  }) {
+    final kept = <MessageImage>[];
+    for (final image in images.reversed) {
+      if (kept.length >= budget) break;
+      if (image.isUrl) {
+        kept.insert(0, image);
+        continue;
+      }
+      final data = _imagePayload(image.ref);
+      if (data != null) kept.insert(0, image.withData(data));
+    }
+    return kept;
+  }
+
+  /// The wire copy of an agent's [messages]: every turn's pictures resolved by
+  /// [wireImagesFor], with [kMaxWireImages] shared across the whole request,
+  /// newest first. The messages themselves (and so the saved session) keep
+  /// their refs — base64 only ever exists on this copy.
+  List<AgentMessage> withWireImages(List<AgentMessage> messages) {
+    if (!messages.any((m) => m.images.isNotEmpty)) return messages;
+    var budget = kMaxWireImages;
+    final out = List<AgentMessage>.of(messages);
+    for (var i = out.length - 1; i >= 0; i--) {
+      final m = out[i];
+      if (m.images.isEmpty) continue;
+      final kept = budget <= 0
+          ? const <MessageImage>[]
+          : wireImagesFor(m.images, budget: budget);
+      budget -= kept.length;
+      out[i] = m.withImages(kept);
     }
     return out;
   }
@@ -6577,7 +7740,7 @@ class AppState extends ChangeNotifier {
     conversation.updatedAt = DateTime.now();
     _moveToTop(conversation);
     notifyListeners();
-    await _saveConversations();
+    await _saveChat(conversation);
   }
 
   /// The exact prompt behind the message at [index] — for "View prompt"/"Info".
@@ -6599,7 +7762,21 @@ class AppState extends ChangeNotifier {
         conversation.isGroup && !isUser && safe < conversation.messages.length
         ? characterFor(conversation, conversation.messages[safe].speakerId)
         : null;
-    return _assemble(conversation, historyEnd: end, responder: responder);
+    final assembled = _assemble(
+      conversation,
+      historyEnd: end,
+      responder: responder,
+    );
+    return AssembledPrompt(
+      messages: assembled.messages,
+      params: assembled.params,
+      sections: assembled.sections,
+      totalTokens: assembled.totalTokens,
+      maxContext: assembled.maxContext,
+      toolRunId: !isUser && safe < conversation.messages.length
+          ? conversation.messages[safe].toolRun?.id
+          : null,
+    );
   }
 
   /// The speaker label a group turn is prefixed with on the wire ("Name: …").
@@ -6766,6 +7943,10 @@ class AppState extends ChangeNotifier {
     if (!_streaming) return;
     _stopRequested = true;
     _client.cancel();
+    _cancelChatToolRun?.call();
+    if (_chatToolClient != null) {
+      _chatToolClient!.cancel();
+    }
   }
 
   /// Lists models for [provider], or the active provider when omitted.
@@ -6841,13 +8022,26 @@ class AppState extends ChangeNotifier {
   }
 
   void _moveToTop(Conversation conversation) {
-    _conversations.remove(conversation);
+    // A hosted chat is not in the app's list and must never be put into it.
+    if (!_conversations.remove(conversation)) return;
     _conversations.insert(0, conversation);
   }
 
   @override
   void dispose() {
+    _btwDisposed = true;
+    for (final run in _btwRequests.values.toList()) {
+      run.cancel();
+    }
+    for (final run in _btwTitleRuns.values.toList()) {
+      run.cancel();
+    }
     _client.cancel();
+    _cancelChatToolRun?.call();
+    _chatToolClient?.cancel();
+    for (final client in _chatToolImageClients.toList()) {
+      client.cancel();
+    }
     _floatPersist?.cancel();
     _imageRatioPersist?.cancel();
     _defaultAvatarSaveTimer?.cancel();
@@ -6867,6 +8061,7 @@ class AssembledPrompt {
     required this.sections,
     required this.totalTokens,
     required this.maxContext,
+    this.toolRunId,
   });
 
   final List<ChatMessage> messages;
@@ -6874,4 +8069,5 @@ class AssembledPrompt {
   final List<PromptSection> sections;
   final int totalTokens;
   final int maxContext;
+  final String? toolRunId;
 }
