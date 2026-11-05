@@ -1,5 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="84" height="48" viewBox="0 0 84 48" role="img" aria-label="Issues">
-<title>Issues</title><rect x="0.5" y="0.5" width="83" height="47" rx="23.5" fill="#342A45"/>
-<g fill="none" stroke="#E8DEF8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14h17v15h-9l-6 5v-5h-2z"/><path d="M20 18v5m0 3v.2"/></g>
-<text x="37" y="28.5" font-family="Roboto,Arial,sans-serif" font-size="13" font-weight="600" fill="#E8DEF8">Issues</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="90" height="76" viewBox="0 0 90 76" role="img" aria-label="Issues">
+  <title>Issues</title>
+  <rect x="2" y="2" width="86" height="72" rx="20" fill="#49405B"/>
+  <g fill="none" stroke="#FFFFFF" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M32 13h26v21H44l-9 7v-7h-3z"/><path d="M45 18v8m0 4v.3"/></g>
+  <text x="45" y="62" text-anchor="middle" font-family="Roboto,Arial,sans-serif" font-size="16" font-weight="700" fill="#FFFFFF">Issues</text>
 </svg>

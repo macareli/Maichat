@@ -3,9 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/macareli/Maichat/releases/latest"><img src="docs/assets/download-button.svg" width="84" height="48" alt="Download APK" /></a>
-  <a href="https://github.com/macareli/Maichat/issues/new"><img src="docs/assets/issue-button.svg" width="84" height="48" alt="Report an issue" /></a>
-  <a href="https://github.com/macareli/Maichat/stargazers"><img src="docs/assets/star-button.svg" width="84" height="48" alt="Star on GitHub" /></a>
+  <a href="https://github.com/macareli/Maichat/releases/latest"><img src="docs/assets/download-button.svg" width="90" height="76" alt="Download APK" /></a><a href="https://github.com/macareli/Maichat/issues/new"><img src="docs/assets/issue-button.svg" width="90" height="76" alt="Report an issue" /></a><a href="https://github.com/macareli/Maichat/stargazers"><img src="docs/assets/star-button.svg" width="90" height="76" alt="Star on GitHub" /></a>
 </p>
 
 <p align="center"><sup>Download <b>MaiChat-1.19.4.apk</b> from the latest release and open it on Android.</sup></p>

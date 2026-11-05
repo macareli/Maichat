@@ -41,7 +41,7 @@ adb exec-out screencap -p > docs/screenshots/readme/01-mobile.png
 Follow the [native capture runbook](developer%20notes/screenshots.md), including
 its data-preservation and privacy requirements. The supplied header remains
 unchanged in `docs/assets/picsart_header.png` and fills the README width. The
-three solid Material-style SVG actions use 84 × 48 targets on one inline row.
+three solid Material-style SVG actions use 90 × 76 targets on one inline row.
 
 The original widget previews remain separate regression/development fixtures:
 
