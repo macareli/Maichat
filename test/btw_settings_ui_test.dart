@@ -75,42 +75,39 @@ void main() {
     await tester.pumpAndSettle();
   }
 
-  for (final global in [false, true]) {
-    testWidgets(
-      'arrow opacity slider ${global ? 'global page' : 'side window'} saves on release',
-      (tester) async {
-        final (state, controller) = await boot();
-        await tester.pumpWidget(
-          global
-              ? ChangeNotifierProvider<AppState>.value(
-                  value: state,
-                  child: const MaterialApp(home: BtwSettingsPage()),
-                )
-              : host(controller),
-        );
-        if (!global) await open(tester);
-        final slider = find.byKey(const Key('btw-arrow-opacity'));
-        expect(slider, findsOneWidget);
-        expect(find.text('100%'), findsOneWidget);
-        final drag = await tester.startGesture(tester.getCenter(slider));
-        await drag.moveBy(const Offset(-600, 0));
-        await tester.pump();
-        expect(
-          state.btwSettings.mainChatArrowOpacity,
-          1,
-          reason: 'dragging does not write settings on every frame',
-        );
-        expect(find.text('10%'), findsOneWidget);
-        await drag.up();
-        await tester.pumpAndSettle();
-        expect(state.btwSettings.mainChatArrowOpacity, 0.1);
-        final restored = AppState();
-        await restored.init();
-        expect(restored.btwSettings.mainChatArrowOpacity, 0.1);
-        restored.dispose();
-      },
+  testWidgets('arrow opacity is only in global settings and saves on release', (
+    tester,
+  ) async {
+    final (state, controller) = await boot();
+    await tester.pumpWidget(host(controller));
+    await open(tester);
+    expect(find.byKey(const Key('btw-arrow-opacity')), findsNothing);
+    await tester.pumpWidget(
+      ChangeNotifierProvider<AppState>.value(
+        value: state,
+        child: const MaterialApp(home: BtwSettingsPage()),
+      ),
     );
-  }
+    final slider = find.byKey(const Key('btw-arrow-opacity'));
+    expect(slider, findsOneWidget);
+    expect(find.text('100%'), findsOneWidget);
+    final drag = await tester.startGesture(tester.getCenter(slider));
+    await drag.moveBy(const Offset(-600, 0));
+    await tester.pump();
+    expect(
+      state.btwSettings.mainChatArrowOpacity,
+      1,
+      reason: 'dragging does not write settings on every frame',
+    );
+    expect(find.text('10%'), findsOneWidget);
+    await drag.up();
+    await tester.pumpAndSettle();
+    expect(state.btwSettings.mainChatArrowOpacity, 0.1);
+    final restored = AppState();
+    await restored.init();
+    expect(restored.btwSettings.mainChatArrowOpacity, 0.1);
+    restored.dispose();
+  });
 
   testWidgets(
     'saved threads search, select and create without losing prior threads',

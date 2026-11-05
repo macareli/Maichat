@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import '../models/chat_interface.dart';
 import '../screens/studio/shell/liquid_panel.dart';
 import '../models/btw_conversation.dart';
+import 'btw_chat_surface.dart';
 import 'btw_settings_panel.dart';
 import 'btw_thread_controller.dart';
 import 'message_markdown.dart';
@@ -147,7 +148,6 @@ class _BtwThreadState extends State<BtwThread> {
                 children: [
                   Padding(
                     padding: EdgeInsets.only(
-                      top: top,
                       bottom: MediaQuery.viewInsetsOf(context).bottom > 0
                           ? MediaQuery.viewInsetsOf(context).bottom
                           : MediaQuery.viewPaddingOf(context).bottom,
@@ -155,48 +155,87 @@ class _BtwThreadState extends State<BtwThread> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        Padding(
-                          padding: const EdgeInsets.fromLTRB(60, 16, 20, 12),
-                          child: Row(
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  widget
-                                          .controller
-                                          .activeThread
-                                          ?.displayTitle ??
-                                      'By the way',
-                                  key: const Key('btw-thread-title'),
-                                  maxLines:
-                                      constraints.maxHeight - top - bottom < 400
-                                      ? 1
-                                      : 2,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: theme.textTheme.titleLarge,
-                                ),
-                              ),
-                              IconButton(
-                                tooltip: 'New side thread',
-                                onPressed: () {
-                                  widget.controller.startThread();
-                                  _input.clear();
-                                },
-                                key: const Key('btw-new-thread'),
-                                icon: const Icon(Icons.edit_square),
-                              ),
-                            ],
-                          ),
-                        ),
                         Expanded(
-                          child: ListView.builder(
+                          child: CustomScrollView(
                             key: const Key('btw-transcript'),
                             reverse: true,
-                            padding: const EdgeInsets.fromLTRB(60, 24, 20, 16),
-                            itemCount: exchanges.length,
-                            itemBuilder: (context, index) {
-                              final i = exchanges.length - index - 1;
-                              return _cachedExchange(exchanges[i], i, theme);
-                            },
+                            slivers: [
+                              SliverPadding(
+                                padding: const EdgeInsets.fromLTRB(
+                                  20,
+                                  8,
+                                  20,
+                                  4,
+                                ),
+                                sliver: SliverToBoxAdapter(
+                                  child: Text(
+                                    widget.actionsEnabled
+                                        ? 'Outside the story. Tool changes are saved.'
+                                        : 'Not added to the conversation',
+                                    key: const Key('btw-transcript-note'),
+                                    style: theme.textTheme.bodySmall?.copyWith(
+                                      color: scheme.onSurfaceVariant.withValues(
+                                        alpha: 0.5,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              SliverPadding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 20,
+                                ),
+                                sliver: SliverList.builder(
+                                  itemCount: exchanges.length,
+                                  itemBuilder: (context, index) {
+                                    final i = exchanges.length - index - 1;
+                                    return _cachedExchange(
+                                      exchanges[i],
+                                      i,
+                                      theme,
+                                    );
+                                  },
+                                ),
+                              ),
+                              SliverFillRemaining(
+                                hasScrollBody: false,
+                                child: Align(
+                                  alignment: Alignment.topCenter,
+                                  child: Container(
+                                    key: const Key('btw-title-gradient'),
+                                    width: double.infinity,
+                                    padding: EdgeInsets.fromLTRB(
+                                      20,
+                                      top + 16,
+                                      72,
+                                      28,
+                                    ),
+                                    decoration: const BoxDecoration(
+                                      gradient: LinearGradient(
+                                        begin: Alignment.topCenter,
+                                        end: Alignment.bottomCenter,
+                                        colors: [
+                                          Colors.black,
+                                          Colors.transparent,
+                                        ],
+                                      ),
+                                    ),
+                                    child: Text(
+                                      widget
+                                              .controller
+                                              .activeThread
+                                              ?.displayTitle ??
+                                          'By the way',
+                                      key: const Key('btw-thread-title'),
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: theme.textTheme.labelLarge
+                                          ?.copyWith(color: Colors.white),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                         ConstrainedBox(
@@ -209,27 +248,7 @@ class _BtwThreadState extends State<BtwThread> {
                               ),
                             ),
                           ),
-                          child: SingleChildScrollView(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.stretch,
-                              children: [
-                                Padding(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 20,
-                                  ),
-                                  child: Text(
-                                    widget.actionsEnabled
-                                        ? 'Outside the story. Tool changes are saved.'
-                                        : 'Not added to the conversation',
-                                    style: theme.textTheme.bodySmall?.copyWith(
-                                      color: scheme.onSurfaceVariant,
-                                    ),
-                                  ),
-                                ),
-                                _composer(theme),
-                              ],
-                            ),
-                          ),
+                          child: SingleChildScrollView(child: _composer(theme)),
                         ),
                       ],
                     ),
@@ -241,7 +260,11 @@ class _BtwThreadState extends State<BtwThread> {
                       theme,
                       key: const Key('btw-close'),
                       tooltip: 'Back to chat',
-                      icon: Icons.arrow_back,
+                      icon: Icons.arrow_forward,
+                      background: Builder(
+                        builder: (context) =>
+                            BtwChatSurface.fragment(context, top: top + 56),
+                      ),
                       onPressed: () {
                         if (_settingsOpen) {
                           setState(() => _settingsOpen = false);
@@ -262,6 +285,23 @@ class _BtwThreadState extends State<BtwThread> {
                         _focus.unfocus();
                         setState(() => _settingsOpen = !_settingsOpen);
                       },
+                    ),
+                  ),
+                  Positioned(
+                    top: top + 8,
+                    right: 8,
+                    child: IconButton.filledTonal(
+                      key: const Key('btw-new-thread'),
+                      tooltip: 'New side thread',
+                      constraints: const BoxConstraints.tightFor(
+                        width: 48,
+                        height: 48,
+                      ),
+                      onPressed: () {
+                        widget.controller.startThread();
+                        _input.clear();
+                      },
+                      icon: const Icon(Icons.edit_square),
                     ),
                   ),
                   LiquidPanel(
@@ -287,18 +327,30 @@ class _BtwThreadState extends State<BtwThread> {
     required String tooltip,
     required IconData icon,
     required VoidCallback onPressed,
+    Widget? background,
   }) => Material(
-    elevation: 2,
-    color: theme.colorScheme.surfaceContainerHigh,
+    elevation: background == null ? 2 : 0,
+    color: background == null
+        ? theme.colorScheme.surfaceContainerHigh
+        : Colors.transparent,
+    surfaceTintColor: Colors.transparent,
+    clipBehavior: Clip.antiAlias,
     borderRadius: const BorderRadius.horizontal(right: Radius.circular(12)),
     child: SizedBox(
       width: 48,
       height: 48,
-      child: IconButton(
-        key: key,
-        tooltip: tooltip,
-        onPressed: onPressed,
-        icon: Icon(icon),
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          if (background != null)
+            Positioned.fill(child: IgnorePointer(child: background)),
+          IconButton(
+            key: key,
+            tooltip: tooltip,
+            onPressed: onPressed,
+            icon: Icon(icon),
+          ),
+        ],
       ),
     ),
   );

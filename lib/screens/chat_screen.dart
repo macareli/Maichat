@@ -25,6 +25,7 @@ import '../state/app_state.dart';
 import '../widgets/avatar_image.dart';
 import '../widgets/avatar_swipe_sheet.dart';
 import '../widgets/btw_thread.dart';
+import '../widgets/btw_chat_surface.dart';
 import '../widgets/chat_tool_results.dart';
 import '../widgets/character_avatar.dart';
 import '../widgets/floating_images_layer.dart';
@@ -891,19 +892,6 @@ class _ChatScreenState extends State<ChatScreen> {
     final hosted = widget.host != null;
     final chat = Stack(
       children: [
-        // This chat's own picture, behind everything and behind nothing else's.
-        // A thread's own background is the more specific choice and wins; the
-        // one on the interface is what a saved look can carry, and so what
-        // dresses every chat that has not picked its own.
-        if ((conversation.backgroundImage ?? ui.backgroundImage) != null)
-          Positioned.fill(
-            child: _ChatBackground(
-              image: conversation.backgroundImage ?? ui.backgroundImage!,
-              opacity: conversation.backgroundImage != null
-                  ? conversation.backgroundOpacity
-                  : ui.backgroundOpacity,
-            ),
-          ),
         // The legacy send bar is furniture at the foot of the chat, so the
         // whole column slides as one to clear the keyboard. The expressive
         // composer floats over a static thread and lifts on its own — see
@@ -969,6 +957,17 @@ class _ChatScreenState extends State<ChatScreen> {
           asideOpen: _asideOpen,
           hasAside: _aside.activeThread != null,
           asideArrowOpacity: state.btwSettings.mainChatArrowOpacity,
+          background: ColoredBox(
+            color: bg ?? Theme.of(context).scaffoldBackgroundColor,
+            child: (conversation.backgroundImage ?? ui.backgroundImage) == null
+                ? null
+                : _ChatBackground(
+                    image: conversation.backgroundImage ?? ui.backgroundImage!,
+                    opacity: conversation.backgroundImage != null
+                        ? conversation.backgroundOpacity
+                        : ui.backgroundOpacity,
+                  ),
+          ),
           onAsideOpen: _setAsideOpen,
           onAsideVisible: (visible) {
             if (_asideVisible != visible) {
@@ -3317,6 +3316,7 @@ class _ChatPanes extends StatefulWidget {
     required this.asideOpen,
     required this.hasAside,
     required this.asideArrowOpacity,
+    required this.background,
     required this.onAsideOpen,
     required this.onAsideVisible,
     required this.asideWidth,
@@ -3334,6 +3334,7 @@ class _ChatPanes extends StatefulWidget {
   final bool asideOpen;
   final bool hasAside;
   final double asideArrowOpacity;
+  final Widget background;
   final ValueChanged<bool> onAsideOpen;
   final ValueChanged<bool> onAsideVisible;
   final double asideWidth;
@@ -3741,6 +3742,20 @@ class _ChatPanesState extends State<_ChatPanes> with TickerProviderStateMixin {
         key: const Key('chat-main-pane'),
         child: Stack(
           children: [
+            Positioned.fill(
+              child: ClipRect(
+                child: LayoutBuilder(
+                  builder: (context, bounds) => OverflowBox(
+                    alignment: Alignment.topLeft,
+                    minWidth: bounds.maxWidth + BtwChatSurface.tabWidth,
+                    maxWidth: bounds.maxWidth + BtwChatSurface.tabWidth,
+                    minHeight: bounds.maxHeight,
+                    maxHeight: bounds.maxHeight,
+                    child: widget.background,
+                  ),
+                ),
+              ),
+            ),
             Positioned.fill(child: widget.child),
             if (widget.hasAside && !widget.asideOpen)
               Positioned(
@@ -3833,7 +3848,20 @@ class _ChatPanesState extends State<_ChatPanes> with TickerProviderStateMixin {
                       child: _asidePresent
                           ? Stack(
                               children: [
-                                Positioned.fill(left: 12, child: asideLayer),
+                                Positioned.fill(
+                                  left: 12,
+                                  child: BtwChatSurface(
+                                    viewport: Size(
+                                      width -
+                                          menuWidth -
+                                          actualAside * _asideProgress +
+                                          BtwChatSurface.tabWidth,
+                                      constraints.maxHeight,
+                                    ),
+                                    background: widget.background,
+                                    child: asideLayer,
+                                  ),
+                                ),
                                 Positioned(
                                   left: 0,
                                   top: 0,
@@ -4013,7 +4041,14 @@ class _ChatPanesState extends State<_ChatPanes> with TickerProviderStateMixin {
                 Positioned.fill(
                   child: AnimatedBuilder(
                     animation: _asideController,
-                    child: asideLayer,
+                    child: BtwChatSurface(
+                      viewport: Size(
+                        width + BtwChatSurface.tabWidth,
+                        constraints.maxHeight,
+                      ),
+                      background: widget.background,
+                      child: asideLayer,
+                    ),
                     builder: (context, pane) => _asidePresent
                         ? Transform.translate(
                             offset: Offset(width * (1 - _asideProgress), 0),

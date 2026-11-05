@@ -13,6 +13,17 @@ symbol references against the current code. Keep technical guidance current.
 Do not add AI authors or coauthors, attribution footers, or session links to
 commits or pull request descriptions.
 
+## Public repository privacy
+
+Privacy is a permanent publication requirement. Keep private source identities,
+usernames, emails, repository links, local paths and source commit IDs out of
+public code, fixtures, documentation, screenshots, artifacts and commit metadata.
+Transfer changes as code-only patches and create independent commits under the
+public repository identity. Never merge private history or add source references
+or cherry-pick trailers. Before each publication, audit the complete staged tree,
+new commit metadata and reachable public history for identifying references.
+Preserve this requirement in future project guidance and handoffs.
+
 ## Build & verify (works in a fresh container/Codespace)
 
 - `flutter pub get`, then `flutter analyze` must be **clean** and `flutter test`

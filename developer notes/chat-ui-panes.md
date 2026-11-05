@@ -18,13 +18,28 @@ Typing `/`, `/b` or `/btw` uses the Studio slash-command list. Sending the side
 question opens a Document-style thread from the right. On phones it covers
 the main chat and pushes that full-width surface left; on larger screens its
 divider resizes it alongside the chat and menu. Each side thread supports
-follow-ups, streamed answers, Stop, copy and Back. The top-left rectangular
+follow-ups, streamed answers, Stop, copy and Back. The top-left right-pointing rectangular
 cutout returns to chat; the matching top-right `<` cutout reopens the existing
 thread. Both support horizontal dragging at the same height. Dragging assigns
 progress directly, pauses/reversals hold exactly, and releases use a spring.
 Touching a closing cutout catches its current position. Covered/closing panes
 exclude focus, semantics and chat taps; the outer pointer listener stays opaque
 so moving controls remain catchable. Reduced-motion settings skip the settle.
+
+The side transcript uses the full pane width with symmetric 20 dp text padding;
+the 48 dp left controls overlay it without reserving a text gutter. A small title
+on a black-to-transparent gradient lives at the oldest end of the reversed scroll
+view, filling unused space so short threads still put it at the screen's top.
+It scrolls away with the content. The faint story-context note is also a scroll
+item above the composer, rather than fixed composer chrome. Neither uses blur,
+scroll listeners, or per-frame transcript rebuilds.
+
+The return tab clips a 48 dp continuation of the main chat's background canvas,
+including its resolved per-chat colour, wallpaper and image opacity. The main
+canvas extends by that width, so both pieces share the same cover scale and crop.
+The small fragment depends on pane geometry; cached transcript rendering and
+retained phone transforms remain independent of it. Images use paint alpha and
+hard/anti-aliased clips without save-layer blur or backdrop sampling.
 
 Every `/btw` command or New side thread action creates a saved thread, including
 a blank command. Threads are stored separately in `btwThreads`; switching main
@@ -43,9 +58,8 @@ selecting a symbol expands its name and editor. Long press or the accessible
 row action opens anchored Delete/Export controls. Export saves only that thread
 as native JSON or text. Android Back closes actions, then settings, then the
 thread. Short keyboard layouts retain 48 dp controls and scroll their content.
-The side settings window and Settings → Side conversations both offer
-Main-chat arrow opacity, from 10–100%, defaulting to fully visible for older
-settings. The global preference persists on slider release. Fill, icon and
+Only Settings → Side conversations offers Main-chat arrow opacity, from
+10–100%, defaulting to fully visible for older settings. The global preference persists on slider release. Fill, icon and
 shadow alpha are painted directly; the 48 dp tap/drag target stays usable.
 
 Settings → Side conversations chooses first-line or AI-generated titles. AI

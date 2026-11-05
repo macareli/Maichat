@@ -7,7 +7,6 @@ import '../models/btw_conversation.dart';
 import '../models/settings.dart';
 import '../screens/studio/shell/liquid_panel.dart';
 import '../state/app_state.dart';
-import 'btw_arrow_opacity_setting.dart';
 import 'btw_thread_controller.dart';
 import 'export_sheet.dart';
 
@@ -318,7 +317,6 @@ class _BtwSettingsPanelState extends State<BtwSettingsPanel> {
         if (index == 0) {
           return Column(
             children: [
-              if (state != null) BtwArrowOpacitySetting(state: state),
               Row(
                 children: [
                   Expanded(
