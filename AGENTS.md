@@ -35,13 +35,13 @@ Preserve this requirement in future project guidance and handoffs.
   setup version check, and CI together when changing the toolchain.
 - Linux smoke test runs headless under `xvfb-run` (e.g. build `--release` for
   linux and launch briefly). Use it to eyeball UI changes.
-- **README screenshots** are generated, never hand-collected:
-  `flutter test test/screenshots/generate.dart --update-goldens` pumps the real
-  screens at 1080×2340 and writes `docs/screenshots/`. Those files are *not*
-  `_test.dart`, so the suite never runs them and CI never diffs the pixels. See
-  `developer notes/screenshots.md` for the traps (test fonts render as black
-  boxes, `debugDisableShadows` draws shadows as hard outlines, image decode needs
-  `runAsync`) and for how a real phone photo is swapped in over a generated file.
+- **README screenshots must come from actual Android app use.** Navigate the
+  running app and acquire gallery pictures through genuine in-app download and
+  import flows, then capture with native `adb exec-out screencap -p`. Never use
+  an injected demo catalogue, seeded AppState, generated placeholder artwork, or widget-test
+  fixtures as README product photos. Preserve existing data and redact by
+  choosing a safe screen, not by inventing its contents. Keep regression/widget
+  previews separate. See `developer notes/screenshots.md` for the capture runbook.
 - Android release APK: `flutter build apk --release` produces a universal APK.
 
 ### Build requirements

@@ -1,15 +1,11 @@
 <p align="center">
-  <img src="docs/assets/picsart_header.png" alt="MaiChat" width="720"/>
+  <img src="docs/assets/picsart_header.png" alt="MaiChat" width="100%"/>
 </p>
 
 <p align="center">
-  <a href="https://github.com/macareli/Maichat/releases/latest"><img src="docs/assets/download-button.svg" width="280" height="56" alt="Download the latest MaiChat Android APK" /></a>
-</p>
-<p align="center">
-  <a href="https://github.com/macareli/Maichat/issues/new"><img src="docs/assets/issue-button.svg" width="280" height="56" alt="Report a bug or suggest an idea" /></a>
-</p>
-<p align="center">
-  <a href="https://github.com/macareli/Maichat/stargazers"><img src="docs/assets/star-button.svg" width="280" height="56" alt="Star MaiChat on GitHub" /></a>
+  <a href="https://github.com/macareli/Maichat/releases/latest"><img src="docs/assets/download-button.svg" width="84" height="48" alt="Download APK" /></a>
+  <a href="https://github.com/macareli/Maichat/issues/new"><img src="docs/assets/issue-button.svg" width="84" height="48" alt="Report an issue" /></a>
+  <a href="https://github.com/macareli/Maichat/stargazers"><img src="docs/assets/star-button.svg" width="84" height="48" alt="Star on GitHub" /></a>
 </p>
 
 <p align="center"><sup>Download <b>MaiChat-1.19.4.apk</b> from the latest release and open it on Android.</sup></p>
@@ -25,7 +21,7 @@ Regarding the name, Mai is the name of our mascot for our little app, be nice to
 <p align="center"><img src="docs/screenshots/readme/01-mobile.png" alt="A MaiChat conversation in dark mode on a phone" width="320" /></p>
 <p align="center"><img src="docs/screenshots/readme/02-tablet.png" alt="MaiChat’s dark-mode Home dashboard on a tablet" width="720" /></p>
 
-<sup>Dark-mode captures of the real app UI with fictional demo content. <a href="developer%20notes/screenshots.md">How these images are generated</a>.</sup>
+<sup>Dark-mode screenshots captured while using the Android app. <a href="developer%20notes/screenshots.md">How these screenshots are captured</a>.</sup>
 
 ## What's a Roleplay 'Harness?'
 

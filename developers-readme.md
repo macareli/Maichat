@@ -29,26 +29,27 @@ ID and signing certificate; see the [build workflow](.github/workflows/build-apk
 
 ## README pictures
 
-The README uses dark-theme captures of the real app screens, with fictional
-demo content and generated stand-in art. Regenerate the eight README images:
+The README uses native screenshots captured while actually using the Android
+app in dark mode. Browse live Discover sources and download/import genuine
+pictures through the app before showing the Gallery. Do not substitute seeded
+state, generated placeholder artwork, a demo catalogue, or widget-test fixtures.
 
 ```sh
-flutter test test/screenshots/readme_dark.dart --update-goldens
+adb exec-out screencap -p > docs/screenshots/readme/01-mobile.png
 ```
 
-The header is the supplied artwork in `docs/assets/picsart_header.png`.
-The three local SVG action buttons use solid Material-style fills and shapes,
-with no blur or animation. Each is a 280 × 56 link target, on its own row so
-it remains usable on a narrow GitHub mobile page.
+Follow the [native capture runbook](developer%20notes/screenshots.md), including
+its data-preservation and privacy requirements. The supplied header remains
+unchanged in `docs/assets/picsart_header.png` and fills the README width. The
+three solid Material-style SVG actions use 84 × 48 targets on one inline row.
 
-The separate original fixture set can still be regenerated with:
+The original widget previews remain separate regression/development fixtures:
 
 ```sh
 flutter test test/screenshots/generate.dart --update-goldens
 ```
 
-See [screenshot notes](developer%20notes/screenshots.md) for font loading,
-image decoding and the limits of headless captures.
+They are not README product screenshots.
 
 ## Notes
 

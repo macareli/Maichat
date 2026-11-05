@@ -1,25 +1,41 @@
 # Screenshots
 
-The README uses eight dark-theme captures in `docs/screenshots/readme/`:
-`01-mobile.png` through `08-gallery.png`. Regenerate them with:
+## README captures: actual Android app use
 
-```sh
-flutter test test/screenshots/readme_dark.dart --update-goldens
-```
+README photos in `docs/screenshots/readme/` must be native screenshots from
+actual app interactions. They must not use injected state, seeded demo worlds,
+generated placeholder artwork, a demo catalogue, or widget-test rendering. Regression and
+development previews are separate from product photos.
 
-`readme_dark.dart` pumps the real phone and tablet screens with a dark Material
-3 Expressive theme, fictional chats and draft content, a local demo catalogue,
-and generated stand-in art. It asserts dark brightness before each capture.
-No provider requests are sent. The side-thread capture uses a saved completed
-exchange. The recipe precaches rendered image providers and then advances the
-test clock through the image fade. Waiting for decoding alone leaves
-`SmoothImage` at zero opacity, so a gallery can have captions but blank tiles. The header is the supplied `docs/assets/picsart_header.png`, copied
-without image manipulation. Local SVG action links use solid fills and no blur.
+1. Use an installed Android app with a matching signing certificate. Do not
+   uninstall, clear data, or overwrite existing user content to prepare a photo.
+2. Switch the app to Dark mode through its navigation/settings controls.
+3. Browse a live Discover source and download suitable cards/pictures through
+   the app. Use newly created chats/workspaces where appropriate. Gallery photos
+   must contain genuine downloaded pictures imported through its actual UI.
+4. Open each screen through normal taps and scrolling. Wait for pictures and
+   transitions to finish. Hide the keyboard unless it explains the feature.
+5. Capture the unaltered screen:
 
-The original seven screenshot fixtures remain in `docs/screenshots/`, named
-`01-chat.png` … `07-preview.png`. Their generation details follow.
+   ```sh
+   adb exec-out screencap -p > docs/screenshots/readme/01-mobile.png
+   ```
 
-## Regenerating them
+6. Inspect every PNG for readable text, decoded pictures, dark UI and unintended
+   private content. Choose a safe view instead of injecting or fabricating data.
+7. Keep account identities, API keys, device identifiers, private package names,
+   machine paths and source-repository details out of public capture notes.
+   Record only the screen, public app version where applicable, display size and
+   the real navigation/download workflow. Restore temporary display changes.
+
+The eight filenames are `01-mobile`, `02-tablet`, `03-chat-tools`,
+`04-agentic-studio`, `05-discover`, `06-home`, `07-library` and `08-gallery`
+(with `.png`). `docs/screenshots/readme/CAPTURES.md` records their provenance.
+The supplied header remains unchanged as `docs/assets/picsart_header.png`.
+Its existing transparent padding is retained; README width is 100%. Action links
+use solid SVG fills, no blur or animation, and share a compact inline row.
+
+## Separate widget previews
 
 ```bash
 flutter test test/screenshots/generate.dart --update-goldens
@@ -42,27 +58,18 @@ actually changed: every regeneration rewrites all seven files, and that is about
 None of those files end in `_test.dart`, which is deliberate: `flutter test`
 collects only `*_test.dart`, so the suite never runs them and **CI never diffs
 these pixels**. Goldens disagree across machines over font hinting and
-antialiasing; a README picture is not worth a red build.
+antialiasing; these developer previews do not gate CI.
 
-## What a generated shot is and isn't
+## Widget preview scope
 
-It is the real screen: the real widgets, under a real `AppState`, dressed in the
-app's own `MaiChatApp.themeFor`. The words in the demo chat, the cast, the spend
-history and the pictures are invented; nothing else is.
+These fixtures render production widgets with synthetic application state,
+invented dialogue and generated stand-in art. They are useful for layout checks
+and regression review. They are never substitutes for the README screenshots.
 
-It is **not** a photograph of a phone. Four differences worth knowing before
-deciding a shot is good enough:
-
-- **The palette is the default violet seed.** A real device on Android 12+ takes
-  its colours from the wallpaper, and no two users see the same screenshot.
-- **No status bar, no gesture bar.** The view padding is set so the app *lays
-  out* as if they were there (72 physical pixels at the top, 36 at the bottom),
-  but nothing draws in that space.
-- **The art is arithmetic.** `png.dart` writes gradients, so no card's
-  third-party portrait is required for the generated illustrations.
-- **The Discover feed is a stand-in.** `demo_catalogue.dart` invents the
-  listings rather than reproducing a real site's, which is why the source is
-  called "Demo catalogue" instead of one of the eight real names.
+Their theme, fonts and view padding are controlled by the test binding. They
+have no Android status/navigation bars, and the fixture Discover feed does not
+contact a live catalogue. Native capture instructions above apply to every
+README image.
 
 ## Rendering constraints
 
@@ -74,7 +81,7 @@ deciding a shot is good enough:
   with one; a phone falls back to Noto, a test host falls back to nothing.
 - **Shadows.** `testWidgets` sets `debugDisableShadows`, which turns every
   elevation into a hard black outline — right for a golden diff, wrong for a
-  README illustration. `usePhone` clears the flag and `shoot` puts it back, because the
+  developer preview. `usePhone` clears the flag and `shoot` puts it back, because the
   binding fails a test that leaves a painting flag changed.
 - **Pictures need real time.** An avatar decodes on the engine's own thread,
   which the fake clock inside `testWidgets` never advances, so `pumpAndSettle`
@@ -84,8 +91,9 @@ deciding a shot is good enough:
   clock (see AGENTS.md); `seedChat` writes the turns onto the conversation
   directly.
 
-## Replacing one with a real photograph
+## Maintaining product screenshots
 
-Take the shot on a phone, crop off the status bar if you like, save it over the
-file with the same name. Keep them all portrait and roughly the same aspect
-ratio (the generated ones are 1080×2340) or the README grid goes ragged.
+Replace README images only with new native captures from actual app use.
+Retain the screen-specific filename and its intended phone/tablet orientation,
+and update `docs/screenshots/readme/CAPTURES.md` with the genuine workflow.
+Do not run a fixture generator over the README image directory.

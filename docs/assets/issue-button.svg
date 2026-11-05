@@ -1,6 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="280" height="56" viewBox="0 0 280 56" role="img" aria-label="Report an issue">
-  <title>Report an issue</title>
-  <rect x="0.5" y="0.5" width="279" height="55" rx="27.5" fill="#342A45"/>
-  <path d="M22 17h20v16H30l-7 6v-6h-1z" fill="none" stroke="#E8DEF8" stroke-width="2.2" stroke-linejoin="round"/><path d="M32 22v5m0 3v.2" stroke="#E8DEF8" stroke-width="2.2" stroke-linecap="round"/>
-  <text x="60" y="34" font-family="Roboto,Arial,sans-serif" font-size="17" font-weight="600" fill="#E8DEF8">Report an issue</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="84" height="48" viewBox="0 0 84 48" role="img" aria-label="Issues">
+<title>Issues</title><rect x="0.5" y="0.5" width="83" height="47" rx="23.5" fill="#342A45"/>
+<g fill="none" stroke="#E8DEF8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14h17v15h-9l-6 5v-5h-2z"/><path d="M20 18v5m0 3v.2"/></g>
+<text x="37" y="28.5" font-family="Roboto,Arial,sans-serif" font-size="13" font-weight="600" fill="#E8DEF8">Issues</text>
 </svg>

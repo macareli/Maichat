@@ -1,6 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="280" height="56" viewBox="0 0 280 56" role="img" aria-label="Get Android APK">
-  <title>Get Android APK</title>
-  <rect x="0.5" y="0.5" width="279" height="55" rx="27.5" fill="#D0BCFF"/>
-  <path d="M32 15v15m-6-6 6 6 6-6M23 34v5h18v-5" fill="none" stroke="#2B1745" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/>
-  <text x="60" y="34" font-family="Roboto,Arial,sans-serif" font-size="17" font-weight="600" fill="#2B1745">Get Android APK</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="84" height="48" viewBox="0 0 84 48" role="img" aria-label="APK">
+<title>APK</title><rect x="0.5" y="0.5" width="83" height="47" rx="23.5" fill="#D0BCFF"/>
+<g fill="none" stroke="#2B1745" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12v12m-5-5 5 5 5-5M13 27v5h14v-5"/></g>
+<text x="37" y="28.5" font-family="Roboto,Arial,sans-serif" font-size="13" font-weight="600" fill="#2B1745">APK</text>
 </svg>
