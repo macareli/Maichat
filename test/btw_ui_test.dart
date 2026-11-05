@@ -226,7 +226,11 @@ void main() {
       expect(
         find.descendant(
           of: find.byKey(const Key('btw-transcript')),
-          matching: find.text('where is this harbour?'),
+          matching: find.byWidgetPredicate(
+            (widget) =>
+                widget is SelectableText &&
+                widget.data == 'where is this harbour?',
+          ),
         ),
         findsOneWidget,
       );

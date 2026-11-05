@@ -6,7 +6,7 @@
 /// against *this* string, so a stale value here makes an up-to-date install
 /// offer an update it already has, for ever. `test/app_version_test.dart` reads
 /// pubspec.yaml and fails when they drift.
-const String kAppVersion = '1.19.3';
+const String kAppVersion = '1.19.4';
 
 /// Whether this is MaiChat Beta: the same code built as a second app
 /// (`io.github.macareli.maichat.beta`) that installs beside MaiChat with its own data,
@@ -26,5 +26,6 @@ const String kAppDisplayName = kIsBeta ? 'MaiChat Beta' : 'MaiChat';
 
 /// The version as the app shows it: a beta carries its build number, since
 /// every beta build shares the release's version string.
-const String kAppVersionLabel =
-    kIsBeta ? '$kAppVersion-b$kBetaBuild' : kAppVersion;
+const String kAppVersionLabel = kIsBeta
+    ? '$kAppVersion-b$kBetaBuild'
+    : kAppVersion;
