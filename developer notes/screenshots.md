@@ -1,9 +1,23 @@
 # Screenshots
 
-The pictures in the README live in `docs/screenshots/`, one PNG per shot, named
-`01-chat.png` … `07-preview.png`. **The filenames are the contract**: the README
-points at them and nothing else, so any of them can be replaced with a
-photograph off a real phone and no markup has to change.
+The README uses eight dark-theme captures in `docs/screenshots/readme/`:
+`01-mobile.png` through `08-gallery.png`. Regenerate them with:
+
+```sh
+flutter test test/screenshots/readme_dark.dart --update-goldens
+```
+
+`readme_dark.dart` pumps the real phone and tablet screens with a dark Material
+3 Expressive theme, fictional chats and draft content, a local demo catalogue,
+and generated stand-in art. It asserts dark brightness before each capture.
+No provider requests are sent. The side-thread capture uses a saved completed
+exchange. The recipe precaches rendered image providers and then advances the
+test clock through the image fade. Waiting for decoding alone leaves
+`SmoothImage` at zero opacity, so a gallery can have captions but blank tiles. The header is the supplied `docs/assets/picsart_header.png`, copied
+without image manipulation. Local SVG action links use solid fills and no blur.
+
+The original seven screenshot fixtures remain in `docs/screenshots/`, named
+`01-chat.png` … `07-preview.png`. Their generation details follow.
 
 ## Regenerating them
 
