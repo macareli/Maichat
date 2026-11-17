@@ -9,6 +9,7 @@ import 'chat_export.dart';
 import 'chat_graph_screen.dart';
 import 'chat_import.dart';
 import 'chat_screen.dart';
+import 'discover/discover_card.dart' show compactCount;
 
 /// The full list of recent conversations. Reached from the drawer's "Chats"
 /// destination; a single conversation opens on top as a detail screen, so the
@@ -376,6 +377,11 @@ class ChatCard extends StatelessWidget {
         : shown.messages.last.content
             .replaceAll(RegExp(r'\s+'), ' ')
             .trim();
+    // The row's message count, shown as a pill on the avatar. Like the preview
+    // and the timestamp, it describes the freshest branch — the chat the reader
+    // was last in — not the whole tree, whose branches would each re-count the
+    // turns they inherited from the root.
+    final messageCount = shown.messages.length;
     return Card(
       elevation: 0,
       color: scheme.surfaceContainerLow,
@@ -383,13 +389,9 @@ class ChatCard extends StatelessWidget {
       clipBehavior: Clip.antiAlias,
       child: ListTile(
         onTap: onTap,
-        leading: CircleAvatar(
-          backgroundColor: scheme.secondaryContainer,
-          child: Icon(
-            branches > 0 ? Icons.account_tree_outlined : Icons.chat_bubble_outline,
-            color: scheme.onSecondaryContainer,
-            size: 20,
-          ),
+        leading: _AvatarWithCount(
+          branches: branches,
+          messageCount: messageCount,
         ),
         title: Row(
           children: [
@@ -481,6 +483,77 @@ class ChatCard extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// The row avatar with the chat's message count pinned to its bottom-right —
+/// a chat bubble (or the tree glyph when the row collapses branches) with a
+/// small "N messages" pill riding on its corner.
+class _AvatarWithCount extends StatelessWidget {
+  const _AvatarWithCount({required this.branches, required this.messageCount});
+
+  /// How many branches the row's tree has; non-zero swaps the glyph.
+  final int branches;
+
+  /// The freshest branch's turn count, formatted with [compactCount].
+  final int messageCount;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        CircleAvatar(
+          backgroundColor: scheme.secondaryContainer,
+          child: Icon(
+            branches > 0
+                ? Icons.account_tree_outlined
+                : Icons.chat_bubble_outline,
+            color: scheme.onSecondaryContainer,
+            size: 20,
+          ),
+        ),
+        Positioned(
+          right: -4,
+          bottom: -4,
+          child: _MessageCountBadge(count: messageCount),
+        ),
+      ],
+    );
+  }
+}
+
+/// The small count pill on a chat row's avatar: how many messages the chat
+/// holds, in [compactCount] form so a long thread reads "1.2k" not "1234".
+class _MessageCountBadge extends StatelessWidget {
+  const _MessageCountBadge({required this.count});
+
+  final int count;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+      decoration: BoxDecoration(
+        color: scheme.primaryContainer,
+        borderRadius: BorderRadius.circular(6),
+        // Ring the pill with the surface it sits on so it reads as a badge on
+        // the avatar, not a smudge caught in its corner.
+        border: Border.all(
+          color: scheme.surfaceContainerLow,
+          width: 1.5,
+        ),
+      ),
+      child: Text(
+        compactCount(count),
+        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+              color: scheme.onPrimaryContainer,
+              fontWeight: FontWeight.w700,
+            ),
       ),
     );
   }
