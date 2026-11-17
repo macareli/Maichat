@@ -37,7 +37,10 @@ Future<void> showStudioApplyFlow(
           children: [
             Text(
               existing
-                  ? 'Replaces ${c.displayName} in your library with this draft.'
+                  ? session.baseline != null
+                      ? 'Merges this draft\'s changes into the current '
+                          '${c.displayName} card in your library.'
+                      : 'Replaces ${c.displayName} in your library with this draft.'
                   : 'Adds ${c.displayName} to your characters.',
             ),
             if (ws.preset case final preset?) ...[

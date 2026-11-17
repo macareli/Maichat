@@ -1361,13 +1361,43 @@ class StudioController extends ChangeNotifier {
   }
 
   /// Writes the draft into the library: the character (in place, when the
-  /// session was opened from one or applied before), every lorebook by id, the
-  /// documents when embeddings are on, the selected generation preset by id,
-  /// and — with [bundleFolder] — a folder
+  /// session was opened from one or applied before — merged onto the library's
+  /// current card, so a change another session applied in between survives),
+  /// every lorebook by id, the documents when embeddings are on, the selected
+  /// generation preset by id, and — with [bundleFolder] — a folder
   /// holding all of it.
   Future<StudioApplyResult> apply({bool bundleFolder = false}) async {
     final ws = session.workspace.clone();
-    final character = ws.character;
+    var character = ws.character;
+    // A session carrying a baseline (it was opened from, or loaded, a library
+    // card) lays only what the draft changed since onto the library's *current*
+    // card, rather than replacing the card wholesale: another session applied
+    // in between keeps its changes. The merged card becomes the draft, so the
+    // library and the draft agree until the next edit. No baseline — a new
+    // character, a derived one, a catalogue import — or a card the library no
+    // longer holds: the draft is the card, as before.
+    final baseline = session.baseline;
+    final current =
+        baseline == null ? null : state.characterById(baseline.id);
+    if (baseline != null && current != null) {
+      final merged = current.toJson();
+      final from = baseline.toJson();
+      final to = character.toJson();
+      for (final key in {...from.keys, ...to.keys}) {
+        // The identity and the timestamps are not changes.
+        if (key == 'id' || key == 'createdAt' || key == 'updatedAt') continue;
+        if (_sameJson(from[key], to[key])) continue;
+        if (to.containsKey(key)) {
+          merged[key] = to[key];
+        } else {
+          merged.remove(key);
+        }
+      }
+      character = Character.fromJson(merged);
+      session
+        ..workspace.character = character
+        ..baseline = character.clone();
+    }
     // A book removed from the draft stays attached to nothing it is not in.
     character.lorebookIds.removeWhere(
       (id) => ws.lorebook(id) == null && state.lorebookById(id) == null,
@@ -1472,6 +1502,24 @@ class StudioController extends ChangeNotifier {
 
   /// Waits for every save asked for so far. For tests, and for leaving.
   Future<void> flush() => _saving;
+
+  /// Whether two `toJson` values carry the same thing. Deep: the merge walks
+  /// whole values (lists, maps included), so one changed list is a change, but
+  /// two equal ones are not.
+  static bool _sameJson(Object? a, Object? b) {
+    if (a is Map && b is Map) {
+      if (a.length != b.length) return false;
+      return a.entries.every((e) => _sameJson(e.value, b[e.key]));
+    }
+    if (a is List && b is List) {
+      if (a.length != b.length) return false;
+      for (var i = 0; i < a.length; i++) {
+        if (!_sameJson(a[i], b[i])) return false;
+      }
+      return true;
+    }
+    return a == b;
+  }
 
   /// Repaints on a cadence, not per delta, as the chat does.
   void _paintSoon() {
@@ -1852,6 +1900,9 @@ StudioSession studioSessionFor(AppState state, Character character) {
     id: now.microsecondsSinceEpoch.toString(),
     title: character.displayName,
     sourceCharacterId: character.id,
+    // The card applying is diffed against, so two sessions on one character
+    // each land their own changes instead of the last one replacing the rest.
+    baseline: character.clone(),
     appliedSinceChange: true,
     workspace: StudioWorkspace(
       character: character.clone(),

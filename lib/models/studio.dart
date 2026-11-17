@@ -785,6 +785,7 @@ class StudioSession {
     List<StudioSubagent>? subagents,
     List<StudioTodo>? todos,
     this.sourceCharacterId,
+    this.baseline,
     this.folderId,
     this.appliedAt,
     this.appliedSinceChange = false,
@@ -845,6 +846,16 @@ class StudioSession {
 
   /// The library character this session was opened from, when it was.
   final String? sourceCharacterId;
+
+  /// The library card as it stood when the session took it as its starting
+  /// point — the card at the other end of [sourceCharacterId] at open, or at a
+  /// `load_library_character` replace that kept the library id. Kept on the
+  /// session, not the workspace: applying diffs it against the draft and lays
+  /// only the changed parts onto the library's *current* card, so a second
+  /// session applied in between survives (a plain overwrite would revert it).
+  /// Null for a session with no library tie; refreshed to the merged card on
+  /// every merged apply.
+  Character? baseline;
 
   /// The folder an apply bundled the draft into, reused by the next apply.
   String? folderId;
@@ -1010,6 +1021,7 @@ class StudioSession {
           'subagents': [for (final a in subagents) a.toJson()],
         if (todos.isNotEmpty) 'todos': [for (final t in todos) t.toJson()],
         if (sourceCharacterId != null) 'sourceCharacterId': sourceCharacterId,
+        if (baseline != null) 'sourceBaseline': baseline!.toJson(),
         if (folderId != null) 'folderId': folderId,
         if (appliedAt != null) 'appliedAt': appliedAt!.toIso8601String(),
         if (appliedSinceChange) 'appliedSinceChange': true,
@@ -1103,6 +1115,11 @@ class StudioSession {
         ],
         todos: StudioTodo.listFrom(json['todos']),
         sourceCharacterId: json['sourceCharacterId'] as String?,
+        baseline: json['sourceBaseline'] is Map
+            ? Character.fromJson(
+                Map<String, dynamic>.from(json['sourceBaseline'] as Map),
+              )
+            : null,
         folderId: json['folderId'] as String?,
         appliedAt: DateTime.tryParse(json['appliedAt'] as String? ?? ''),
         appliedSinceChange: json['appliedSinceChange'] as bool? ?? false,

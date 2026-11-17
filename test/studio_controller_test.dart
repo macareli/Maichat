@@ -294,4 +294,46 @@ void main() {
     expect(state.characters, hasLength(1));
     expect(state.characterById('lib')!.description, 'After.');
   });
+
+  test('two sessions on one character each land their own changes', () async {
+    script = [];
+    final state = await boot();
+    final original = Character(
+      id: 'lib',
+      name: 'Old',
+      description: 'Before.',
+      personality: 'Dour.',
+    );
+    await state.saveCharacter(original);
+    // Both sessions start from the same card, so both baselines are it.
+    final first = studioSessionFor(state, state.characterById('lib')!);
+    final second = studioSessionFor(state, state.characterById('lib')!);
+    final one =
+        StudioController(state: state, store: StudioStore(dir), session: first);
+    final two =
+        StudioController(state: state, store: StudioStore(dir), session: second);
+    addTearDown(one.flush);
+    addTearDown(two.flush);
+    one.editByHand('x', (ws) => ws.character.description = 'First change.');
+    two.editByHand('x', (ws) => ws.character.personality = 'Second change.');
+
+    await one.apply();
+    // The second session was opened before the first applied; before the
+    // merge, its apply reverted the description to the card it copied.
+    await two.apply();
+    final merged = state.characterById('lib')!;
+    expect(state.characters, hasLength(1));
+    expect(merged.description, 'First change.');
+    expect(merged.personality, 'Second change.');
+    // The draft became the merged card, so the second session knows it is
+    // applied — and its baseline moved with it.
+    expect(second.workspace.character.personality, 'Second change.');
+    expect(second.baseline!.description, 'First change.');
+    expect(second.appliedSinceChange, isTrue);
+
+    // The baseline survives the round trip through the store.
+    await two.flush();
+    final saved = await StudioStore(dir).read(second.id);
+    expect(saved!.baseline!.personality, 'Second change.');
+  });
 }

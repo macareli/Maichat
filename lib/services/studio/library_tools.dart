@@ -213,8 +213,8 @@ final StudioTool loadLibraryCharacterTool = StudioTool(
         'edit_original': {
           'type': 'boolean',
           'description': 'replace only: keep the library character\'s id, so '
-              'applying overwrites it. Only when the user asked to edit that '
-              'character.',
+              'applying merges the draft\'s changes into it. Only when the '
+              'user asked to edit that character.',
         },
         'keep_lorebooks': {
           'type': 'boolean',
@@ -254,6 +254,12 @@ final StudioTool loadLibraryCharacterTool = StudioTool(
       ];
       final character = source.copyWith(id: original ? source.id : _newId());
       character.lorebookIds = [for (final b in copies) b.id];
+      // Editing the original: the card applying is diffed against is the one
+      // just loaded, so only the draft's changes land on it — another session
+      // applied in between keeps its own. A derived character has no library
+      // tie to merge against, and its baseline is cleared in case the draft
+      // was editing something else before.
+      ctx.session.baseline = original ? source.clone() : null;
       ctx.edit(
         'load_library_character',
         original
