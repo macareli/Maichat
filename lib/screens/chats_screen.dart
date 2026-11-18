@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 
 import '../models/conversation.dart';
 import '../services/chat_graph.dart';
+import '../services/chat_client.dart';
 import '../state/app_state.dart';
 import '../widgets/app_drawer.dart';
 import 'chat_export.dart';
@@ -148,6 +149,8 @@ class _ChatsScreenState extends State<ChatsScreen> {
           onDelete: () => _confirmDelete(context, state, tree),
           onTogglePin: () => state.togglePinnedTree(tree.root.id),
           onGraph: () => _openGraph(context, tree.root.id),
+          namingTitle: state.isNamingTitle(tree.latest.id),
+          onGenerateTitle: () => _generateTitle(context, state, tree.latest.id),
         );
 
     if (pinned.isEmpty) {
@@ -186,6 +189,43 @@ class _ChatsScreenState extends State<ChatsScreen> {
           builder: (_) => ChatGraphScreen(conversationId: id),
         ),
       );
+
+  /// Asks the model to name a chat straight from its row — no need to open
+  /// the thread first. The row's own menu shows the run's progress; a rename
+  /// arriving while the row is on screen is just a new title in the list.
+  Future<void> _generateTitle(
+    BuildContext context,
+    AppState state,
+    String id,
+  ) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final conversation = state.conversationById(id);
+    if (conversation == null) return;
+    if (conversation.isEmpty) {
+      _rowToast(messenger, 'Nothing to name yet.');
+      return;
+    }
+    try {
+      final title = await state.generateTitle(id);
+      if (title == null) {
+        _rowToast(messenger, 'The model came up with nothing.');
+      } else {
+        _rowToast(messenger, 'Named "$title".');
+      }
+    } on ChatApiException catch (e) {
+      _rowToast(messenger, e.message);
+    }
+  }
+
+  void _rowToast(ScaffoldMessengerState messenger, String message) =>
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(message),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
 
   Widget _sectionHeader(BuildContext context, String label) =>
       SliverToBoxAdapter(
@@ -345,6 +385,8 @@ class ChatCard extends StatelessWidget {
     this.onTogglePin,
     this.tree,
     this.onGraph,
+    this.namingTitle = false,
+    this.onGenerateTitle,
   });
 
   /// The chat this row is named after — the tree's root when [tree] is set.
@@ -360,6 +402,15 @@ class ChatCard extends StatelessWidget {
 
   /// Opens the Chat Graph for this tree; when null the action is hidden.
   final VoidCallback? onGraph;
+
+  /// Whether a "Generate title" request is in flight for the chat this row
+  /// would name, so the item can show progress instead of firing again.
+  final bool namingTitle;
+
+  /// Asks the model to name this row's chat (its freshest branch on a fork
+  /// tree — the branch the row already previews and dates); when null the
+  /// action is hidden.
+  final VoidCallback? onGenerateTitle;
 
   @override
   Widget build(BuildContext context) {
@@ -442,6 +493,7 @@ class ChatCard extends StatelessWidget {
             if (value == 'export') exportChat(context, conversation);
             if (value == 'pin') onTogglePin?.call();
             if (value == 'graph') onGraph?.call();
+            if (value == 'title') onGenerateTitle?.call();
           },
           itemBuilder: (context) => [
             if (onGraph != null && branches > 0)
@@ -451,6 +503,25 @@ class ChatCard extends StatelessWidget {
                   contentPadding: EdgeInsets.zero,
                   leading: Icon(Icons.account_tree_outlined),
                   title: Text('Chat Graph'),
+                ),
+              ),
+            if (onGenerateTitle != null)
+              PopupMenuItem<String>(
+                value: 'title',
+                enabled: !namingTitle,
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: namingTitle
+                      ? const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: Padding(
+                            padding: EdgeInsets.all(2),
+                            child: CircularProgressIndicator(strokeWidth: 3),
+                          ),
+                        )
+                      : const Icon(Icons.auto_fix_high_outlined),
+                  title: Text(namingTitle ? 'Naming…' : 'Generate title'),
                 ),
               ),
             if (onTogglePin != null)

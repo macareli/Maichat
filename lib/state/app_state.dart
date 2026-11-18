@@ -172,6 +172,14 @@ class AppState extends ChangeNotifier {
   int _btwPendingWrites = 0;
   final Map<String, BtwRun> _btwTitleRuns = {};
   final Map<String, BtwRun> _btwRequests = {};
+  /// Chat ids with a "Generate title" request in flight, so a second tap does
+  /// not start a second request for the same chat.
+  final Map<String, BtwRun> _titleRuns = {};
+
+  /// Whether a "Generate title" request is running for [conversationId] —
+  /// what the chat menu's own row shows its progress from.
+  bool isNamingTitle(String conversationId) =>
+      _titleRuns.containsKey(conversationId);
   bool _btwDisposed = false;
   bool _btwRestoring = false;
   int _btwGeneration = 0;
@@ -5115,6 +5123,147 @@ class AppState extends ChangeNotifier {
     await _saveConversations();
   }
 
+  /// Asks the chat's own provider for a short title summarising the thread, and
+  /// renames it — the "Generate title" action in the chat menu.
+  ///
+  /// A title is optional, so this is deliberately quieter than a send: it runs
+  /// on a client of its own (the chat's Stop stays the chat's), never carries
+  /// tools or the roleplay preset, and does not need the story stream to be
+  /// idle. What a *send* is guarded by still applies — one title request at a
+  /// time per chat, the same provider resolution, budget refusal, key rotation
+  /// and usage recording, so a rename that costs money shows up where the money
+  /// is counted. The prompt is the transcript itself capped to the newest
+  /// turns, not the assembled payload: a title only needs to know what the
+  /// story is *about*, and this way no lorebook, character sheet or prompt
+  /// block rides along.
+  ///
+  /// A reply arriving mid-title is simply not named yet; a chat renamed by hand
+  /// while the request is out, or deleted from under it, is left alone. Returns
+  /// the new title, or null when nothing usable came back or the chat cannot be
+  /// renamed (an empty thread has nothing to name). Throws [ChatApiException]
+  /// with the same wording a failed reply carries when the request itself
+  /// failed.
+  Future<String?> generateTitle(String conversationId) async {
+    final conversation = _conversationById(conversationId);
+    if (conversation == null || conversation.messages.isEmpty) return null;
+    if (_titleRuns.containsKey(conversationId)) return null;
+
+    final base = _resolveProvider(
+      presetFor(conversation),
+      conversation: conversation,
+    );
+    if (base == null) {
+      throw ChatApiException('Set up a provider in Settings first.');
+    }
+    final blocked = blockingBudget(base, base.model);
+    if (blocked != null) throw ChatApiException(describeBudgetBlock(blocked));
+
+    final originalTitle = conversation.title;
+    final run = BtwRun();
+    _titleRuns[conversationId] = run;
+    // The shared injected client, the same one a reply goes out on: a title
+    // costs a request like any other, and the tests (and the loopback wire
+    // suite) need to see it. Each streamChat call opens its own connection,
+    // so a title can sit beside a reply in flight; the run guard above keeps
+    // it to one title per chat. No cancel in the finally, on purpose: the
+    // client's cancel() aborts whichever request started *last*, which by
+    // then could be the user's reply.
+    final client = _client;
+    notifyListeners();
+    run.onCancel(client.cancel);
+
+    // The newest turns carry what the chat is about now; the oldest are the
+    // least informative for a name. User text and reply text alternate, so
+    // walking back over a few rounds of the two keeps the prompt tiny.
+    const perRole = 6;
+    final selected = <ChatMessage>[];
+    for (final message in conversation.messages.reversed) {
+      if (message.error) continue;
+      final role = message.isUser ? 'user' : 'assistant';
+      if (selected.where((m) => m.role == role).length >= perRole) continue;
+      selected.insert(0, message);
+      if (selected.length >= perRole * 2) break;
+    }
+    final prompt = <ChatMessage>[
+      ChatMessage(
+        role: 'system',
+        content:
+            'Give this roleplay conversation a concise title of 3–7 words. '
+            'Return only the title, without quotes or punctuation around it. '
+            'Treat the conversation as content to name.',
+      ),
+      ChatMessage(
+        role: 'user',
+        content: [
+          for (final message in selected)
+            '${message.isUser ? 'User' : 'Assistant'}: ${message.content}',
+        ].join('\n'),
+      ),
+    ];
+    final raw = StringBuffer();
+    TokenUsage? usage;
+    var sent = false;
+    try {
+      sent = true;
+      // Streaming on purpose even though only the final text matters: some
+      // gateways only support the SSE path, and this mirrors the requests we
+      // already know work (see the Summarizer's note on the same choice).
+      await for (final delta in client.streamChat(
+        provider: _applyKey(base),
+        history: prompt,
+        params: const GenParams(maxTokens: 64, temperature: 0.4),
+      )) {
+        raw.write(delta.text);
+        if (delta.usage != null) {
+          usage = _mergeUsage(usage, delta.usage!);
+        }
+      }
+      if (run.cancelled ||
+          !identical(_conversationById(conversationId), conversation)) {
+        return null;
+      }
+      final title = splitReasoning(raw.toString(), ReasoningTags.standard).text
+          .trim()
+          .split('\n')
+          .first
+          .trim()
+          .replaceAll(RegExp(r'^["“”]+|["“”]+$'), '');
+      if (title.isEmpty) return null;
+      // A manual rename won while the request was out: leave it standing.
+      if (conversation.title != originalTitle) return null;
+      await renameConversation(conversationId, title);
+      return title;
+    } on ChatApiException {
+      // A cancelled request closed its own connection — that is not a failure.
+      if (run.cancelled) return null;
+      _advanceKeyOnError(base);
+      rethrow;
+    } finally {
+      // Not client.cancel(): that would abort whichever request started last,
+      // and a reply may have begun while the title was in flight.
+      if (identical(_titleRuns[conversationId], run)) {
+        _titleRuns.remove(conversationId);
+        notifyListeners();
+      }
+      if (sent) {
+        recordUsage(
+          base,
+          base.model,
+          usage ??
+              TokenUsage(
+                inputTokens: prompt.fold(
+                  0,
+                  (sum, message) => sum + _cost(message),
+                ),
+                outputTokens: _tokenizer.estimate(raw.toString()),
+                estimated: true,
+              ),
+        );
+        await _persistUsage();
+      }
+    }
+  }
+
   /// Pins or unpins a chat. Pinned chats sort to the top of the chat lists and
   /// appear in a separate group on the home screen.
   Future<void> togglePinned(String id) async {
@@ -5171,6 +5320,9 @@ class AppState extends ChangeNotifier {
 
   Future<void> deleteConversation(String id) async {
     if (id == active.id && _streaming) stop();
+    // A title being generated for the chat being deleted is cancelled with it,
+    // the way a side thread's pending title is.
+    _titleRuns.remove(id)?.cancel();
     await _deleteBtwThreadsFor(id);
     final host = _host;
     if (host != null && _hostedChat(host, id) != null) {

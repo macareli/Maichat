@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 import '../models/character.dart';
 import '../models/chat_interface.dart';
 import '../models/conversation.dart';
+import '../services/chat_client.dart';
 import '../state/app_state.dart';
 import '../widgets/avatar_image.dart';
 import '../widgets/character_avatar.dart';
@@ -84,6 +85,10 @@ class _ChatSettingsScreenState extends State<ChatSettingsScreen> {
 
   /// The picture behind this chat, as a reference to persist. Null means none.
   String? _background;
+
+  /// A "Generate title" run started from this screen, so its result is
+  /// swallowed into the title field rather than only persisted.
+  Future<String?>? _pendingTitle;
   double _opacity = 1;
 
   /// This chat's own chat style, or null to follow the app-wide settings.
@@ -172,6 +177,46 @@ class _ChatSettingsScreenState extends State<ChatSettingsScreen> {
     ..showSnackBar(
       SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
     );
+
+  /// Asks the model to name this chat. The run persists the rename itself, so
+  /// it reaches the field here (unless the user is typing a title of their own
+  /// — what is in the box wins over a late model answer). The drawer menu and
+  /// the Chats row menu share the same run through [AppState.isNamingTitle],
+  /// so the same request cannot be started twice from two places.
+  Future<void> _generateTitle() async {
+    final state = context.read<AppState>();
+    final conversation = _conversation(state);
+    if (conversation == null) return;
+    if (conversation.isEmpty) {
+      _toast('Nothing to name yet.');
+      return;
+    }
+    if (_pendingTitle != null) return;
+    final pending = state.generateTitle(conversation.id);
+    setState(() {
+      _pendingTitle = pending;
+    });
+    try {
+      final title = await pending;
+      if (!mounted) return;
+      if (title == null) {
+        _toast('The model came up with nothing.');
+      } else {
+        // The model's name lands in the box as if typed, so Save — with its
+        // dirty check — decides whether it is kept, like any other edit here.
+        _title.text = title;
+      }
+    } on ChatApiException catch (e) {
+      if (!mounted) return;
+      _toast(e.message);
+    } finally {
+      if (mounted) {
+        setState(() {
+          _pendingTitle = null;
+        });
+      }
+    }
+  }
 
   /// Opens the character editor on a draft. What comes back is held here until
   /// Save decides whether it belongs to this chat or to the roster.
@@ -569,9 +614,26 @@ class _ChatSettingsScreenState extends State<ChatSettingsScreen> {
       controller: _title,
       autofocus: false,
       textCapitalization: TextCapitalization.sentences,
-      decoration: const InputDecoration(
+      decoration: InputDecoration(
         labelText: 'Chat title',
-        prefixIcon: Icon(Icons.title_outlined),
+        prefixIcon: const Icon(Icons.title_outlined),
+        // Generate: asks the model to name this chat. While a run is in
+        // flight — here or from the Chats row's menu — the button is a
+        // progress indicator and does not start another.
+        suffixIcon: state.isNamingTitle(conversation.id)
+            ? const SizedBox(
+                width: 24,
+                height: 24,
+                child: Padding(
+                  padding: EdgeInsets.all(2),
+                  child: CircularProgressIndicator(strokeWidth: 3),
+                ),
+              )
+            : IconButton(
+                tooltip: 'Generate a title',
+                icon: const Icon(Icons.auto_fix_high_outlined),
+                onPressed: _generateTitle,
+              ),
       ),
       onChanged: (_) => setState(() {}),
     ),
