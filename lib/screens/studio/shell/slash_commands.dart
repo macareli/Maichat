@@ -23,6 +23,7 @@ class StudioSlashCommands {
     required this.onToast,
     required this.onUnknown,
     this.onBtw,
+    this.onUndo,
     this.memory,
   });
 
@@ -33,6 +34,11 @@ class StudioSlashCommands {
   /// `/btw <question>`: the screen opens the side-question sheet, which asks
   /// through [StudioController.askAside]. Nothing reaches the session.
   final void Function(String question, List<MessageImage> images)? onBtw;
+
+  /// A successful `/undo`: the user's words of the turn at the cut — the
+  /// message the conversation was rewound to — which the screen puts back in
+  /// the composer, unsent, ready to be rephrased and resent.
+  final void Function(String text)? onUndo;
 
   /// `/context`: the context inspector for the agent on screen.
   final void Function() onContext;
@@ -130,6 +136,40 @@ class StudioSlashCommands {
         } else {
           onToast('Nothing is running.');
         }
+      case 'undo':
+        if (controller.busy) {
+          onToast('The Studio is working — try again once it has finished.');
+          return;
+        }
+        final turns = args.isEmpty ? 1 : int.tryParse(args.trim());
+        if (turns == null || turns < 1) {
+          onToast('How many turns: /undo <turns>.');
+          return;
+        }
+        final available = controller.undoableExchanges;
+        if (available == 0) {
+          onToast('Nothing to undo yet.');
+          return;
+        }
+        if (turns > available) {
+          onToast(available == 1
+              ? 'Only 1 turn to undo.'
+              : 'Only $available turns to undo.');
+          return;
+        }
+        final changes = controller.rewoundChanges(turns);
+        final dropped = controller.undoTurns(turns);
+        var message = turns == 1
+            ? 'Dropped the last turn.'
+            : 'Dropped the last $turns turns.';
+        if (changes.isNotEmpty) {
+          final noun = changes.length == 1 ? 'change' : 'changes';
+          message += ' Rewound ${changes.length} draft $noun.';
+        }
+        onToast(message);
+        // The turn the conversation was rewound to is back in the composer,
+        // ready to rephrase and resend — nothing is sent.
+        if (dropped != null) onUndo?.call(dropped);
       case 'compact':
         if (controller.running) {
           onToast('The Studio summarises on its own while it works — try '

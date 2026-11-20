@@ -355,6 +355,7 @@ class StudioOp {
     required this.before,
     DateTime? at,
     this.reverted = false,
+    this.transcriptLen = 0,
   }) : at = at ?? DateTime.now();
 
   final String id;
@@ -371,6 +372,12 @@ class StudioOp {
   final DateTime at;
   bool reverted;
 
+  /// How long the transcript was when the change was made — what places a
+  /// change in the conversation, so `/undo` drops the changes made during the
+  /// turns it drops. Zero in sessions saved before it was recorded, where no
+  /// change is placed and none is dropped.
+  final int transcriptLen;
+
   Map<String, dynamic> toJson() => {
         'id': id,
         'tool': tool,
@@ -378,6 +385,7 @@ class StudioOp {
         'before': before,
         'at': at.toIso8601String(),
         if (reverted) 'reverted': true,
+        if (transcriptLen > 0) 'transcriptLen': transcriptLen,
       };
 
   factory StudioOp.fromJson(Map<String, dynamic> json) => StudioOp(
@@ -387,6 +395,7 @@ class StudioOp {
         before: json['before'] as String? ?? '',
         at: DateTime.tryParse(json['at'] as String? ?? ''),
         reverted: json['reverted'] as bool? ?? false,
+        transcriptLen: (json['transcriptLen'] as num?)?.toInt() ?? 0,
       );
 }
 
@@ -769,6 +778,23 @@ const String kInterruptedCallResult =
     'Interrupted before it finished — the app was closed. Call it again if it '
     'is still needed.';
 
+/// Where `/undo` cuts the transcript: the index of the [turns]-th-from-last
+/// user turn, so what is removed is whole exchanges — that turn and everything
+/// after it up to the next one (the agent's replies, its tool calls and their
+/// results). Every user-role message — including the notes injected mid-run —
+/// sits at a step boundary, never between a call and its result, so a cut
+/// leaves a transcript every dialect still accepts. Returns null when there
+/// are not [turns] exchanges to undo.
+int? undoCutIndex(List<AgentMessage> transcript, int turns) {
+  if (turns < 1) return null;
+  final starts = <int>[
+    for (var i = 0; i < transcript.length; i++)
+      if (transcript[i].role == AgentRole.user) i,
+  ];
+  if (starts.length < turns) return null;
+  return starts[starts.length - turns];
+}
+
 /// How many snapshots a session keeps. Older changes stay listed but can no
 /// longer be rewound to; without a cap a long session's file would carry a
 /// full copy of the character per edit.
@@ -959,6 +985,7 @@ class StudioSession {
       tool: tool,
       summary: summary,
       before: before,
+      transcriptLen: transcript.length,
     ));
     appliedSinceChange = false;
     updatedAt = DateTime.now();
@@ -999,6 +1026,54 @@ class StudioSession {
     appliedSinceChange = false;
     return undone;
   }
+
+  /// Drops the last [turns] exchanges of the conversation (each the user's
+  /// turn and everything after it, so it can be rephrased and sent again),
+  /// taking the draft changes made during those turns with it, rewound the way
+  /// [rewindTo] rewinds them. Compactions covering the dropped region go too —
+  /// their summary describes turns that are no longer there — and a run the app
+  /// closing cut off is no longer one to resume. Returns how many exchanges
+  /// were dropped.
+  int undoTurns(int turns) {
+    final cut = undoCutIndex(transcript, turns);
+    if (cut == null) return 0;
+    transcript.removeRange(cut, transcript.length);
+    compactions.removeWhere((c) => c.upTo > cut);
+    // The changes made while those turns existed, newest first: rewinding to
+    // before the oldest of them undoes every one of them. A change made during
+    // a dropped exchange was made after that exchange's user turn arrived, so
+    // its recorded transcript length passes the cut; one at or before it —
+    // including every change made before the conversation started, and every
+    // one a session saved before `transcriptLen` existed records — stays.
+    var rewind = -1;
+    for (var i = ops.length - 1; i >= 0; i--) {
+      if (ops[i].reverted || ops[i].transcriptLen <= cut) continue;
+      rewind = i;
+    }
+    if (rewind >= 0) rewindTo(rewind);
+    interrupted = false;
+    updatedAt = DateTime.now();
+    // A cut lands on a user turn, so no call is separated from its result;
+    // this is the belt to that braces.
+    repairUnansweredCalls(transcript, (_) => kInterruptedCallResult);
+    return turns;
+  }
+
+  /// The user's words of the turn at the cut `/undo [turns]` rewinds to —
+  /// the message to put back in the composer, unsent, like a retry that does
+  /// not go by itself. Deeper user turns within the dropped region are gone
+  /// with the rest, undo being what the user asked for; only the one the
+  /// conversation was rewound *to* comes back. Notes the Studio injected
+  /// mid-run are not the user's words, so a cut on one returns null. The call
+  /// belongs to [undoTurns], which must read it before the transcript is
+  /// cut.
+  String? undoneTurnText(int turns) {
+    final cut = undoCutIndex(transcript, turns);
+    if (cut == null) return null;
+    final text = transcript[cut].text;
+    return text.startsWith('[Studio note]') ? null : text;
+  }
+
 
   Map<String, dynamic> toJson() => {
         'id': id,

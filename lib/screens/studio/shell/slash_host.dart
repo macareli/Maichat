@@ -43,6 +43,7 @@ class StudioSlashHost {
       onToast: _toast,
       onUnknown: state.showUnknown,
       onBtw: _askAside,
+      onUndo: _restoreUndoneText,
     );
     controller.onSlashCommand = runner.handle;
     unawaited(_load());
@@ -143,6 +144,17 @@ class StudioSlashHost {
         behavior: SnackBarBehavior.floating,
         margin: EdgeInsets.fromLTRB(16, 0, 16, toastInset() + 12),
       ));
+  }
+
+  /// `/undo`: the user's words of the turn the conversation was rewound to,
+  /// back in the composer — unsent, ready to be rephrased, like a retry that
+  /// does not go by itself.
+  void _restoreUndoneText(String text) {
+    input.value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(offset: text.length),
+    );
+    state.dismiss();
   }
 
   /// `/btw`: the side-question sheet, asking through

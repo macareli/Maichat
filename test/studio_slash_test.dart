@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:maichat/models/agent_message.dart';
 import 'package:maichat/models/message_image.dart';
 import 'package:maichat/models/provider.dart';
+import 'package:maichat/models/studio.dart';
 import 'package:maichat/screens/studio/shell/slash_commands.dart';
 import 'package:maichat/services/studio/studio_commands.dart';
 import 'package:maichat/services/studio/studio_controller.dart';
@@ -87,8 +88,9 @@ void main() {
 
   /// The runner as the screen builds it, with its UI actions recorded.
   ({StudioSlashCommands runner, List<String> did}) wire(
-    StudioController controller,
-  ) {
+    StudioController controller, {
+    void Function(String text)? onUndo,
+  }) {
     final did = <String>[];
     final runner = StudioSlashCommands(
       controller: controller,
@@ -99,6 +101,7 @@ void main() {
       onNewSession: () async => did.add('new'),
       onToast: (m) => did.add('toast: $m'),
       onUnknown: (text, images, name) => did.add('unknown: $name'),
+      onUndo: onUndo,
     );
     controller.onSlashCommand = runner.handle;
     return (runner: runner, did: did);
@@ -257,5 +260,185 @@ void main() {
         contains('summarising your own working session'));
     expect(controller.session.compactions, hasLength(1));
     expect(w.did.last, 'toast: Summarised the older conversation.');
+  });
+
+  test('/undo drops the last exchange, and the resend goes out clean',
+      () async {
+    final (_, controller) = await boot();
+    final w = wire(controller);
+    await controller.send('First question.');
+    await controller.send('Second question.');
+    expect(requests, hasLength(2));
+    expect(controller.session.transcript, hasLength(4));
+
+    await controller.send('/undo');
+    // An app-only command: nothing is sent, one exchange is gone.
+    expect(requests, hasLength(2));
+    expect(
+      controller.session.transcript.map((m) => m.text),
+      ['First question.', 'Done.'],
+    );
+    expect(w.did.last, 'toast: Dropped the last turn.');
+
+    // The rephrased resend replaces what was dropped on the wire too.
+    await controller.send('Second question, better put.');
+    expect(requests, hasLength(3));
+    final sent = messages(requests.last).map((m) => m['content']).join(' ');
+    expect(sent, contains('Second question, better put.'));
+    expect(sent, isNot(contains('Second question.')));
+  });
+
+  test('/undo puts the dropped turn back in the composer, unsent', () async {
+    final (_, controller) = await boot();
+    final restored = <String>[];
+    final w = wire(controller, onUndo: restored.add);
+    await controller.send('First question.');
+    await controller.send('Second question.');
+    expect(requests, hasLength(2));
+
+    await controller.send('/undo');
+    // Nothing more went out: the text is back in the composer, not sent.
+    expect(requests, hasLength(2));
+    expect(restored, ['Second question.']);
+    expect(w.did.last, 'toast: Dropped the last turn.');
+
+    // Rephrase in place, then send: the dropped words go back out.
+    await controller.send(restored.single, asText: true);
+    expect(requests, hasLength(3));
+    final sent = messages(requests.last).map((m) => m['content']).join(' ');
+    expect(sent, contains('Second question.'));
+    // The first exchange was never dropped; it is still on the wire.
+    expect(sent, contains('First question.'));
+  });
+
+  test('/undo N rewinds to the cut turn and stages only that one', () async {
+    final (_, controller) = await boot();
+    final restored = <String>[];
+    final w = wire(controller, onUndo: restored.add);
+    await controller.send('First question.');
+    await controller.send('Second question.');
+    await controller.send('Third question.');
+
+    await controller.send('/undo 2');
+    expect(requests, hasLength(3));
+    // Both exchanges are gone, but only the turn the conversation was
+    // rewound to — the second, at the cut — comes back: the deeper turns are
+    // gone with the rest, the undo being what the user asked for.
+    expect(restored, ['Second question.']);
+    expect(w.did.last, 'toast: Dropped the last 2 turns.');
+    expect(
+      controller.session.transcript.map((m) => m.text),
+      ['First question.', 'Done.'],
+    );
+  });
+
+  test('/undo rewinds the draft changes made during the dropped turns and '
+      'tells the agent', () async {
+    final (_, controller) = await boot();
+    final w = wire(controller);
+    // A change made during the exchange that is about to be dropped.
+    await controller.send('Make her a keeper of the light.');
+    controller.session.edit(
+      'set_fields',
+      'Set description',
+      (ws) => ws.character.description = 'Keeps the light.',
+    );
+    expect(controller.session.workspace.character.description,
+        'Keeps the light.');
+
+    await controller.send('/undo');
+    expect(requests, hasLength(1));
+    // The draft is back, and the agent is told to read it again.
+    expect(controller.session.workspace.character.description, '');
+    expect(controller.session.ops.single.reverted, isTrue);
+    expect(
+      controller.session.transcript.last.text,
+      contains('The user rewound the draft'),
+    );
+    expect(w.did.last, 'toast: Dropped the last turn. Rewound 1 draft '
+        'change.');
+    // The next send carries the note, so the agent rebuilds on the rewound
+    // draft.
+    await controller.send('Try again.');
+    expect(requests, hasLength(2));
+    final sent = messages(requests.last).map((m) => m['content']).join(' ');
+    expect(sent, contains('Call get_draft before making further changes'));
+  });
+
+  test('/undo N drops N exchanges at once', () async {
+    final (_, controller) = await boot();
+    final w = wire(controller);
+    await controller.send('First question.');
+    await controller.send('Second question.');
+    await controller.send('/undo 2');
+    expect(requests, hasLength(2));
+    expect(controller.session.transcript, isEmpty);
+    expect(w.did.last, 'toast: Dropped the last 2 turns.');
+  });
+
+  test('/undo refuses what there is not, and says what there is', () async {
+    final (_, controller) = await boot();
+    final w = wire(controller);
+    await controller.send('First question.');
+    await controller.send('Second question.');
+    final before = controller.session.transcript.length;
+
+    await controller.send('/undo 3');
+    expect(requests, hasLength(2));
+    expect(controller.session.transcript, hasLength(before));
+    expect(w.did.last, 'toast: Only 2 turns to undo.');
+
+    await controller.send('/undo what');
+    await controller.send('/undo 0');
+    expect(w.did.last, 'toast: How many turns: /undo <turns>.');
+    expect(w.did[w.did.length - 2], 'toast: How many turns: /undo <turns>.');
+    expect(controller.session.transcript, hasLength(before));
+  });
+
+  test('/undo with nothing to undo says so', () async {
+    final (_, controller) = await boot();
+    final w = wire(controller);
+    await controller.send('/undo');
+    expect(requests, isEmpty);
+    expect(controller.session.transcript, isEmpty);
+    expect(w.did.last, 'toast: Nothing to undo yet.');
+  });
+
+  test('/undo refuses while a sub-agent is working', () async {
+    final (_, controller) = await boot();
+    final w = wire(controller);
+    await controller.send('First question.');
+    final before = controller.session.transcript.length;
+    // A background sub-agent at work: busy without a run of the main agent.
+    controller.session.subagents.add(StudioSubagent(
+      id: 'sub',
+      number: 1,
+      description: 'Helper',
+      prompt: 'p',
+      callId: 'c',
+      status: StudioAgentStatus.running,
+    ));
+    await controller.send('/undo');
+    expect(requests, hasLength(1));
+    expect(controller.session.transcript, hasLength(before));
+    expect(w.did.last, 'toast: The Studio is working — try again once it has '
+        'finished.');
+  });
+
+  test('/undo drops a compaction that covered the removed turns', () async {
+    final (_, controller) = await boot();
+    final w = wire(controller);
+    controller.session.transcript
+      ..add(AgentMessage.user('First question.'))
+      ..add(AgentMessage(role: AgentRole.assistant, text: 'Done.'))
+      ..add(AgentMessage.user('Second question.'))
+      ..add(AgentMessage(role: AgentRole.assistant, text: 'Done.'));
+    // Its summary covers part of what is about to be removed.
+    controller.session.compactions
+        .add(StudioCompaction(summary: 'stale', upTo: 3));
+    await controller.send('/undo');
+    expect(requests, isEmpty);
+    expect(controller.session.compactions, isEmpty);
+    expect(w.did.last, 'toast: Dropped the last turn.');
   });
 }

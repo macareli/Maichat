@@ -1317,6 +1317,54 @@ class StudioController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// How many exchanges `/undo` could drop: one per user turn in the
+  /// transcript.
+  int get undoableExchanges =>
+      session.transcript.where((m) => m.role == AgentRole.user).length;
+
+  /// Drops the last [n] exchanges of the conversation so they can be rephrased
+  /// and sent again, rewinding every draft change made during them. Refuses
+  /// while anything is working — a background sub-agent's notes arrive while
+  /// the main agent is not, so [busy] is the guard that closes both races —
+  /// and when there are not [n] exchanges. Returns the user's words of the
+  /// turn at the cut — the text to put back in the composer, unsent, like a
+  /// retry that does not go by itself — or null when nothing was dropped or
+  /// the cut lands on a Studio note.
+  String? undoTurns(int n) {
+    if (busy || n > undoableExchanges) return null;
+    final undoneChanges = rewoundChanges(n);
+    final text = session.undoneTurnText(n);
+    final dropped = session.undoTurns(n);
+    if (dropped == 0) return null;
+    if (undoneChanges.isNotEmpty) {
+      // The agent must not build on a draft it put back: same note as a rewind
+      // made from the Changes view.
+      session.transcript.add(AgentMessage.user(
+        '[Studio note] The user rewound the draft, undoing: '
+        '${undoneChanges.join('; ')}. Call get_draft before making further '
+        'changes.',
+      ));
+    }
+    // A notice about a run whose turns are now gone would describe nothing.
+    notice = null;
+    session.updatedAt = DateTime.now();
+    _save();
+    notifyListeners();
+    return text;
+  }
+
+  /// The change summaries `/undo [n]` is about to rewind, oldest first —
+  /// empty when there are none. Read before [StudioSession.undoTurns] marks
+  /// the changes reverted.
+  List<String> rewoundChanges(int n) {
+    final cut = undoCutIndex(session.transcript, n);
+    if (cut == null) return const <String>[];
+    return [
+      for (final op in session.ops)
+        if (!op.reverted && op.transcriptLen > cut) op.summary,
+    ];
+  }
+
   // --- the Playground ------------------------------------------------------------
 
   /// The Playground: the session's chats with the draft, hosted in the app's

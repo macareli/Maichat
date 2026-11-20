@@ -93,6 +93,13 @@ const List<StudioCommand> kBuiltInCommands = [
     kind: StudioCommandKind.builtIn,
   ),
   StudioCommand(
+    name: 'undo',
+    description: 'Drop the last turns of the conversation, so you can '
+        'rephrase and resend',
+    kind: StudioCommandKind.builtIn,
+    argumentHint: '<turns>',
+  ),
+  StudioCommand(
     name: 'btw',
     description: 'Ask a quick side question — not kept in the session',
     kind: StudioCommandKind.builtIn,

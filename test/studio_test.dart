@@ -499,6 +499,141 @@ void main() {
     });
   });
 
+  group('undoing conversation turns', () {
+    test('the cut index is the start of the Nth-from-last exchange', () {
+      final t = <AgentMessage>[
+        AgentMessage.user('first'),
+        AgentMessage(role: AgentRole.assistant, text: 'a1'),
+        AgentMessage.user('second'),
+        AgentMessage(role: AgentRole.assistant, text: 'a2'),
+        AgentMessage.user('third'),
+      ];
+      expect(undoCutIndex(t, 1), 4);
+      expect(undoCutIndex(t, 2), 2);
+      expect(undoCutIndex(t, 3), 0);
+      expect(undoCutIndex(t, 4), isNull);
+      expect(undoCutIndex(const [], 1), isNull);
+      expect(undoCutIndex(t, 0), isNull);
+      // A note injected mid-run is a user turn like any other.
+      final withNote = <AgentMessage>[
+        AgentMessage.user('first'),
+        AgentMessage(role: AgentRole.assistant, text: 'a1'),
+        AgentMessage.user('[Studio note] something'),
+      ];
+      expect(undoCutIndex(withNote, 1), 2);
+    });
+
+    test('the cut never separates a tool call from its result', () {
+      const call = ToolCall(id: 'c1', name: 'set_fields');
+      final t = <AgentMessage>[
+        AgentMessage.user('first'),
+        AgentMessage(role: AgentRole.assistant, toolCalls: [call]),
+        AgentMessage.toolResult(call, 'done'),
+        AgentMessage(role: AgentRole.assistant, text: 'a1'),
+        AgentMessage.user('second'),
+        AgentMessage(role: AgentRole.assistant, text: 'a2'),
+      ];
+      final cut = undoCutIndex(t, 1);
+      expect(cut, 4);
+      // Everything before the cut keeps its call/result pairs intact.
+      expect(t.take(cut!).where((m) => m.role == AgentRole.tool), isNotEmpty);
+    });
+
+    test('undoTurns drops the exchanges, the stale compactions and the '
+        'interrupted flag', () {
+      session.transcript
+        ..add(AgentMessage.user('first'))
+        ..add(AgentMessage(role: AgentRole.assistant, text: 'a1'))
+        ..add(AgentMessage.user('second'))
+        ..add(AgentMessage(role: AgentRole.assistant, text: 'a2'))
+        ..add(AgentMessage.user('third'))
+        ..add(AgentMessage(role: AgentRole.assistant, text: 'a3'));
+      session.compactions.addAll([
+        StudioCompaction(summary: 'kept', upTo: 2),
+        StudioCompaction(summary: 'gone', upTo: 4),
+      ]);
+      session.interrupted = true;
+      final before = session.updatedAt;
+
+      expect(session.undoTurns(2), 2);
+      expect(
+        session.transcript.map((m) => m.text),
+        ['first', 'a1'],
+      );
+      // The compaction at the cut is aligned and stays; the later one goes.
+      expect(session.compactions.single.summary, 'kept');
+      expect(session.compactions.single.upTo, 2);
+      expect(session.interrupted, isFalse);
+      expect(session.updatedAt, isNot(before));
+
+      // Not enough exchanges left: nothing happens.
+      expect(session.undoTurns(2), 0);
+      expect(session.transcript, hasLength(2));
+    });
+
+    test('undoTurns rewinds the changes made during the dropped turns',
+        () async {
+      // Two changes before anything was sent: they stay.
+      await call('set_fields', {'name': 'Aria'});
+      await call('set_fields', {'description': 'Before.'});
+      session.transcript
+        ..add(AgentMessage.user('first'))
+        ..add(AgentMessage(role: AgentRole.assistant, text: 'a1'));
+      // A change made during the first exchange, then another one and a
+      // second exchange.
+      await call('set_fields', {'description': 'During one.'});
+      session.transcript.add(AgentMessage.user('second'));
+      await call('set_fields', {'description': 'During two.'});
+      session.transcript.add(AgentMessage(role: AgentRole.assistant, text: 'a2'));
+
+      expect(session.undoTurns(2), 2);
+      // The transcript is back to before both exchanges; the draft is back to
+      // before the first change made during them, keeping the two made
+      // before the conversation started.
+      expect(session.transcript, isEmpty);
+      expect(session.workspace.character.name, 'Aria');
+      expect(session.workspace.character.description, 'Before.');
+      expect(session.ops.map((o) => o.reverted), [false, false, true, true]);
+    });
+
+    test('a change recorded without a place in the conversation is kept', () {
+      // Sessions saved before `transcriptLen` existed load ops with 0: no
+      // change is placed, so an undo drops none of them.
+      session.transcript.add(AgentMessage.user('first'));
+      session.transcript.add(AgentMessage(role: AgentRole.assistant, text: 'a1'));
+      session.ops.add(StudioOp(
+        id: 'old',
+        tool: 'set_fields',
+        summary: 'Old change',
+        before: jsonEncode(session.workspace.toJson()),
+        at: DateTime.now(),
+      ));
+      session.undoTurns(1);
+      expect(session.ops.single.reverted, isFalse);
+    });
+
+    test('undoneTurnText is the turn at the cut, never a Studio note', () {
+      session.transcript
+        ..add(AgentMessage.user('first'))
+        ..add(AgentMessage(role: AgentRole.assistant, text: 'a1'))
+        ..add(AgentMessage.user('[Studio note] keep going'))
+        ..add(AgentMessage(role: AgentRole.assistant, text: 'a2'))
+        ..add(AgentMessage.user('second'))
+        ..add(AgentMessage(role: AgentRole.assistant, text: 'a3'));
+      // Read before the cut: it names the turn the conversation is rewound
+      // to — the one message that comes back to the composer. Deeper user
+      // turns are gone with the rest; the Studio's own note is a user-role
+      // message, but not the user's words, so a cut on one restores nothing.
+      expect(session.undoneTurnText(1), 'second');
+      // A cut on the note itself: nothing to put back.
+      expect(session.undoneTurnText(2), isNull);
+      expect(session.undoneTurnText(3), 'first');
+      expect(session.undoneTurnText(4), isNull);
+      session.undoTurns(3);
+      expect(session.transcript, isEmpty);
+    });
+  });
+
   group('the runner', () {
     /// A model that plays back [turns], one per request, recording what it was
     /// sent.
